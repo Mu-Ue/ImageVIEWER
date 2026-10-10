@@ -41,6 +41,27 @@ UINT BitsPerPixel(IWICImagingFactory* wic, IWICBitmapSource* source) {
     return 0;
 }
 
+// Whether any pixel of the source can be less than fully opaque.
+bool CanBeTransparent(IWICImagingFactory* wic, IWICBitmapSource* source) {
+    WICPixelFormatGUID format;
+    ComPtr<IWICComponentInfo> info;
+    ComPtr<IWICPixelFormatInfo2> formatInfo;
+    BOOL transparency = TRUE;
+    if (FAILED(source->GetPixelFormat(&format)) || FAILED(wic->CreateComponentInfo(format, &info)) ||
+        FAILED(info.As(&formatInfo)) || FAILED(formatInfo->SupportsTransparency(&transparency))) {
+        return true;
+    }
+    if (!transparency) return false;
+    // Indexed formats are transparent only if their palette is.
+    ComPtr<IWICPalette> palette;
+    BOOL alpha = TRUE;
+    if (SUCCEEDED(wic->CreatePalette(&palette)) && SUCCEEDED(source->CopyPalette(palette.Get())) &&
+        SUCCEEDED(palette->HasAlpha(&alpha))) {
+        return alpha;
+    }
+    return true;
+}
+
 // Icons hold several sizes and frame 0 is often the smallest, so pick the largest, deepest one.
 HRESULT GetFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, ComPtr<IWICBitmapFrameDecode>& out) {
     HRESULT hr = decoder->GetFrame(0, &out);
@@ -162,6 +183,16 @@ bool ForEachPixel(UINT width, UINT y0, UINT y1, const Placement& place, bool sid
     return place.stepX == Pixel ? walk(std::integral_constant<ptrdiff_t, Pixel>{}) : walk(place.stepX);
 }
 
+// Whether converting the format to 8-bit BGRA keeps every pixel's value.
+bool Is8BitColor(const WICPixelFormatGUID& format) {
+    for (const GUID& f : {GUID_WICPixelFormat24bppBGR, GUID_WICPixelFormat32bppBGR, GUID_WICPixelFormat32bppBGRA,
+                          GUID_WICPixelFormat8bppIndexed, GUID_WICPixelFormat4bppIndexed,
+                          GUID_WICPixelFormat2bppIndexed, GUID_WICPixelFormat1bppIndexed}) {
+        if (format == f) return true;
+    }
+    return false;
+}
+
 // The formats this viewer opens, recognized by their first bytes rather than the file name.
 const GUID* SniffFormat(const BYTE* head, ULONG size) {
     const auto at = [&](ULONG offset, const char* magic, ULONG length) {
@@ -221,8 +252,17 @@ HRESULT CreateDecoder(IWICImagingFactory* wic, IStream* stream, ComPtr<IWICBitma
 }  // namespace
 
 HRESULT OpenSource(IWICImagingFactory* wic, const Source& src, UINT maxSize, ComPtr<IWICBitmapSource>& source,
-                   UINT& width, UINT& height, int* orientation) {
+                   UINT& width, UINT& height, bool* scaled, int* orientation) {
+    if (scaled) *scaled = false;
     if (orientation) *orientation = 1;
+    if (src.bitmap) {
+        ComPtr<IWICBitmap> bitmap;
+        HRESULT hr = wic->CreateBitmapFromHBITMAP(src.bitmap, nullptr, WICBitmapIgnoreAlpha, &bitmap);
+        if (SUCCEEDED(hr)) hr = bitmap->GetSize(&width, &height);
+        if (SUCCEEDED(hr)) source = bitmap;
+        return hr;
+    }
+
     ComPtr<IStream> stream = src.stream;
     HRESULT hr = stream ? S_OK : OpenFileStream(wic, src.path, stream);
     ComPtr<IWICBitmapDecoder> decoder;
@@ -235,11 +275,13 @@ HRESULT OpenSource(IWICImagingFactory* wic, const Source& src, UINT maxSize, Com
     if (UINT64(width) * height > kMaxSourcePixels) return WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
 
     source = frame;
-    if (maxSize && (width > maxSize || height > maxSize)) {
+    const bool scale = maxSize && (width > maxSize || height > maxSize);
+    if (scaled) *scaled = scale;
+    if (scale) {
         // Scaling at the decoder lets codecs like JPEG decode at reduced size directly.
-        const double scale = double(maxSize) / std::max(width, height);
-        width = std::max(1u, UINT(width * scale));
-        height = std::max(1u, UINT(height * scale));
+        const double factor = double(maxSize) / std::max(width, height);
+        width = std::max(1u, UINT(width * factor));
+        height = std::max(1u, UINT(height * factor));
         ComPtr<IWICBitmapScaler> scaler;
         hr = wic->CreateBitmapScaler(&scaler);
         if (SUCCEEDED(hr)) hr = scaler->Initialize(frame.Get(), width, height, WICBitmapInterpolationModeFant);
@@ -279,9 +321,15 @@ HRESULT DecodeImage(const Source& src, Image& out) {
                                   IID_PPV_ARGS(&wic));
     ComPtr<IWICBitmapSource> source;
     UINT width = 0, height = 0;  // of the source, before orientation is applied
+    bool scaled = false;
     int orientation = 1;
-    if (SUCCEEDED(hr)) hr = OpenSource(wic.Get(), src, kMaxBitmapSize, source, width, height, &orientation);
+    if (SUCCEEDED(hr)) {
+        hr = OpenSource(wic.Get(), src, kMaxBitmapSize, source, width, height, &scaled, &orientation);
+    }
     if (FAILED(hr)) return hr;
+    WICPixelFormatGUID format{};
+    source->GetPixelFormat(&format);
+    const bool transparent = CanBeTransparent(wic.Get(), source.Get());
 
     ComPtr<IWICFormatConverter> converter;
     hr = wic->CreateFormatConverter(&converter);
@@ -312,16 +360,19 @@ HRESULT DecodeImage(const Source& src, Image& out) {
     if (!indices && !bitmap) return E_OUTOFMEMORY;
 
     const UINT bg = kBackground & 0xFF;  // gray: all channels equal
+    BYTE alpha = 255;  // AND of all alpha values: 255 if nothing is transparent
     for (UINT y0 = 0; y0 < height; y0 += rows) {
         const UINT n = std::min(rows, height - y0);
         const WICRect rect{0, INT(y0), INT(width), INT(n)};
         hr = converter->CopyPixels(&rect, stripStride, stripStride * n, strip.get());
         if (FAILED(hr)) break;
         BYTE* const begin = strip.get();
-        const BYTE* const end = begin + size_t(stripStride) * n;
+        BYTE* const end = begin + size_t(stripStride) * n;
 
-        // Composite transparent pixels over the background once, so painting is a plain blit.
-        for (BYTE* p = begin; p != end; p += 4) {
+        // Composite transparent pixels over the background once, so painting is a plain blit; sources
+        // that cannot be transparent skip this.
+        for (BYTE* p = transparent ? begin : end; p != end; p += 4) {
+            alpha &= p[3];
             const UINT inverse = 255u - p[3];
             if (inverse == 0) continue;
             const BYTE add = BYTE((bg * inverse + 127) / 255);
@@ -410,5 +461,6 @@ HRESULT DecodeImage(const Source& src, Image& out) {
     out.bitmap = bitmap;
     out.width = outW;
     out.height = outH;
+    out.exact = alpha == 255 && !scaled && Is8BitColor(format);
     return S_OK;
 }
