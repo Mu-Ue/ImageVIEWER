@@ -1,4 +1,4 @@
-#include "ui/downscale.h"
+#include "ui/scale.h"
 
 #include <algorithm>
 #include <atomic>
@@ -8,9 +8,10 @@
 
 namespace {
 
-// The source pixels one output pixel covers, along an axis of src pixels shown as out <= src pixels.
+// The source pixels one output pixel covers, along an axis of src pixels shown as out pixels.
 // Lengths are in units of 1/out source pixel, so output pixel i spans [i*src, (i+1)*src) and every
 // weight is an integer: the first and last pixels may be partly covered, those between weigh out.
+// When enlarging, an output pixel covers at most two source pixels.
 struct Span {
     UINT first, last;  // inclusive
     UINT firstWeight, lastWeight;  // lastWeight is 0 when first == last
@@ -138,17 +139,14 @@ void CALLBACK Work(PTP_CALLBACK_INSTANCE, void* job, PTP_WORK) { RunChunks(*stat
 
 }  // namespace
 
-bool DrawDownscaled(HDC dc, HDC imageDC, int x, int y, int width, int height, const RECT& clip) {
+bool DrawScaled(HDC dc, HDC imageDC, int x, int y, int width, int height, const RECT& clip) {
     DIBSECTION ds{};
     if (GetObjectW(GetCurrentObject(imageDC, OBJ_BITMAP), sizeof(ds), &ds) != sizeof(ds) || !ds.dsBm.bmBits) {
         return false;
     }
     const UINT bpp = ds.dsBm.bmBitsPixel;
     const UINT srcW = UINT(ds.dsBm.bmWidth), srcH = UINT(ds.dsBm.bmHeight);
-    if ((bpp != 24 && bpp != 8 && bpp != 4 && bpp != 1) || width <= 0 || height <= 0 || UINT(width) > srcW ||
-        UINT(height) > srcH) {
-        return false;
-    }
+    if ((bpp != 24 && bpp != 8 && bpp != 4 && bpp != 1) || width <= 0 || height <= 0) return false;
     RGBQUAD colors[256] = {};
     if (bpp <= 8) GetDIBColorTable(imageDC, 0, 256, colors);
 
