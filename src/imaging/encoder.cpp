@@ -90,6 +90,14 @@ HRESULT Buffer(IWICImagingFactory* wic, ComPtr<IWICBitmapSource>& source) {
     return hr;
 }
 
+UINT BitsPerPixel(IWICImagingFactory* wic, const WICPixelFormatGUID& format) {
+    ComPtr<IWICComponentInfo> info;
+    ComPtr<IWICPixelFormatInfo> pixel;
+    UINT bits = 0;
+    if (SUCCEEDED(wic->CreateComponentInfo(format, &info)) && SUCCEEDED(info.As(&pixel))) pixel->GetBitsPerPixel(&bits);
+    return bits;
+}
+
 // Whether pixels in format can be transparent.
 bool HasAlpha(IWICImagingFactory* wic, const WICPixelFormatGUID& format) {
     ComPtr<IWICComponentInfo> info;
@@ -212,15 +220,23 @@ HRESULT Encode(IWICImagingFactory* wic, IWICBitmapSource* source, IStream* strea
     if (SUCCEEDED(hr)) hr = WriteOptions(options.Get(), container);
     if (SUCCEEDED(hr)) hr = frame->Initialize(options.Get());
     if (SUCCEEDED(hr)) hr = frame->SetSize(width, height);
-    if (SUCCEEDED(hr) && !profiles.empty()) {  // without its profile, a wide-gamut image would be read as sRGB
-        std::vector<IWICColorContext*> raw;
-        for (const auto& p : profiles) raw.push_back(p.Get());
-        frame->SetColorContexts(UINT(raw.size()), raw.data());  // formats without profiles fail, harmlessly
-    }
 
     WICPixelFormatGUID sourceFormat{}, format{};
     if (SUCCEEDED(hr)) hr = source->GetPixelFormat(&sourceFormat);
     format = sourceFormat;
+    // BMP holds more than 8 bits per channel only in a fixed-point form other programs can't read, and the JPEG
+    // encoder subsamples CMYK whatever it is asked, so those get 8-bit color as it is shown.
+    if (container == GUID_ContainerFormatBmp && BitsPerPixel(wic, format) > 32) {
+        format = HasAlpha(wic, format) ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat24bppBGR;
+    }
+    const bool cmykToRgb = container == GUID_ContainerFormatJpeg && format == GUID_WICPixelFormat32bppCMYK;
+    if (cmykToRgb) format = GUID_WICPixelFormat24bppBGR;
+    // Without its profile, a wide-gamut image would be read as sRGB; a CMYK profile doesn't fit RGB pixels.
+    if (SUCCEEDED(hr) && !profiles.empty() && !cmykToRgb) {
+        std::vector<IWICColorContext*> raw;
+        for (const auto& p : profiles) raw.push_back(p.Get());
+        frame->SetColorContexts(UINT(raw.size()), raw.data());  // formats without profiles fail, harmlessly
+    }
     if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
     ComPtr<IWICBitmapSource> pixels = source;
     if (SUCCEEDED(hr) && format == GUID_WICPixelFormat8bppIndexed && format != sourceFormat) {

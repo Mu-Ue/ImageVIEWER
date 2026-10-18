@@ -164,11 +164,12 @@ std::wstring FormatSize(ULONGLONG bytes) {
     return std::to_wstring(tenths / 10) + L'.' + std::to_wstring(tenths % 10) + unit;
 }
 
-void ZoomAt(float zoom, float x, float y) {
+// Zooms keeping (x, y) where it is. A step in or out (step) stops at actual size on the way past it.
+void ZoomAt(float zoom, float x, float y, bool step) {
     if (!g.image.bitmap) return;
     const float fitZoom = FitZoom();
     zoom = std::clamp(zoom, fitZoom, std::max(kMaxZoom, fitZoom));
-    if ((g.zoom < 1.0f && zoom > 1.0f) || (g.zoom > 1.0f && zoom < 1.0f)) zoom = 1.0f;  // stop at actual size
+    if (step && ((g.zoom < 1.0f && zoom > 1.0f) || (g.zoom > 1.0f && zoom < 1.0f))) zoom = 1.0f;
     if (zoom == g.zoom) return;
     g.offsetX = x - (x - g.offsetX) * (zoom / g.zoom);
     g.offsetY = y - (y - g.offsetY) * (zoom / g.zoom);
@@ -791,10 +792,10 @@ void RunCommand(UINT cmd) {
         case kCmdCopy: Copy(); break;
         case kCmdPaste: Paste(); break;
         case kCmdSaveAs: SaveAs(); break;
-        case kCmdZoomIn: ZoomAt(g.zoom * kZoomStep, cx, cy); break;
-        case kCmdZoomOut: ZoomAt(g.zoom / kZoomStep, cx, cy); break;
-        case kCmdFit: ZoomAt(FitZoom(), cx, cy); break;
-        case kCmdActualSize: ZoomAt(1.0f, cx, cy); break;
+        case kCmdZoomIn: ZoomAt(g.zoom * kZoomStep, cx, cy, true); break;
+        case kCmdZoomOut: ZoomAt(g.zoom / kZoomStep, cx, cy, true); break;
+        case kCmdFit: ZoomAt(FitZoom(), cx, cy, false); break;
+        case kCmdActualSize: ZoomAt(1.0f, cx, cy, false); break;
         case kCmdPrevious: Step(-1); break;
         case kCmdNext: Step(1); break;
         case kCmdFullscreen: ToggleFullscreen(); break;
@@ -865,7 +866,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ScreenToClient(hwnd, &pt);
             pt.y -= g.barH;
             const float notches = GET_WHEEL_DELTA_WPARAM(wp) / float(WHEEL_DELTA);
-            ZoomAt(g.zoom * std::pow(kZoomStep, notches), float(pt.x), float(pt.y));
+            ZoomAt(g.zoom * std::pow(kZoomStep, notches), float(pt.x), float(pt.y), true);
             return 0;
         }
         case WM_LBUTTONDOWN:
@@ -897,7 +898,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDBLCLK: {  // toggle fit <-> 100% (2x for images smaller than the window)
             const float fitZoom = FitZoom();
             ZoomAt(g.fit ? (fitZoom < 1.0f ? 1.0f : 2.0f) : fitZoom,
-                   float(GET_X_LPARAM(lp)), float(GET_Y_LPARAM(lp) - g.barH));
+                   float(GET_X_LPARAM(lp)), float(GET_Y_LPARAM(lp) - g.barH), false);
             return 0;
         }
         case WM_COMMAND:

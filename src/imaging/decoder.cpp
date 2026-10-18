@@ -58,6 +58,13 @@ UINT BitsPerPixel(IWICImagingFactory* wic, IWICBitmapSource* source) {
 }  // namespace
 
 bool CanBeTransparent(IWICImagingFactory* wic, IWICBitmapSource* source) {
+    // Indexed formats are transparent only if their palette is, although WIC says they never are.
+    ComPtr<IWICPalette> palette;
+    BOOL alpha = TRUE;
+    if (SUCCEEDED(wic->CreatePalette(&palette)) && SUCCEEDED(source->CopyPalette(palette.Get())) &&
+        SUCCEEDED(palette->HasAlpha(&alpha))) {
+        return alpha;
+    }
     WICPixelFormatGUID format;
     ComPtr<IWICComponentInfo> info;
     ComPtr<IWICPixelFormatInfo2> formatInfo;
@@ -66,15 +73,7 @@ bool CanBeTransparent(IWICImagingFactory* wic, IWICBitmapSource* source) {
         FAILED(info.As(&formatInfo)) || FAILED(formatInfo->SupportsTransparency(&transparency))) {
         return true;
     }
-    if (!transparency) return false;
-    // Indexed formats are transparent only if their palette is.
-    ComPtr<IWICPalette> palette;
-    BOOL alpha = TRUE;
-    if (SUCCEEDED(wic->CreatePalette(&palette)) && SUCCEEDED(source->CopyPalette(palette.Get())) &&
-        SUCCEEDED(palette->HasAlpha(&alpha))) {
-        return alpha;
-    }
-    return true;
+    return transparency;
 }
 
 namespace {
