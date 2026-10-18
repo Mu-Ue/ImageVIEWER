@@ -158,7 +158,7 @@ HRESULT WriteImage(IWICImagingFactory* wic, const std::wstring& path, const GUID
         const wchar_t* query = container == GUID_ContainerFormatJpeg ? L"/app1/ifd/{ushort=274}" : L"/ifd/{ushort=274}";
         if (SUCCEEDED(hr)) hr = meta->SetMetadataByName(query, &value);
     }
-    const UINT bpp = indexed ? 8 : format == GUID_WICPixelFormat32bppBGRA ? 32 : 24;
+    const UINT bpp = indexed || format == GUID_WICPixelFormat8bppGray ? 8 : format == GUID_WICPixelFormat32bppBGRA ? 32 : 24;
     const UINT stride = (w * bpp / 8 + 3) & ~3u;
     std::vector<BYTE> pixels(size_t(stride) * h);
     std::vector<UINT32> few(fewColorRows ? fewColors : 0);
@@ -219,6 +219,8 @@ void TestOrientation(IWICImagingFactory* wic) {
         const wchar_t* ext;
         UINT h, fewColorRows;
     } kinds[] = {{GUID_ContainerFormatJpeg, GUID_WICPixelFormat24bppBGR, L".jpg", 97, 0},
+                 // Over a million pixels, so it is decoded in bands on several threads.
+                 {GUID_ContainerFormatJpeg, GUID_WICPixelFormat24bppBGR, L".jpg", 7000, 0},
                  {GUID_ContainerFormatTiff, GUID_WICPixelFormat8bppIndexed, L".tif", 97, 0},
                  // Decoded in strips of 1747 rows, so the colors run out in the second one.
                  {GUID_ContainerFormatTiff, GUID_WICPixelFormat24bppBGR, L".tif", 4000, 2000}};
@@ -303,6 +305,23 @@ void TestSave(IWICImagingFactory* wic) {
     for (const BYTE b : pixels) dark += b < 250;
     if (pixels.empty() || dark) Fail("transparent pixels saved as JPEG aren't white", dark);
     for (const std::wstring& path : {jpg, copy, png, flat}) DeleteFileW(path.c_str());
+
+    // Gray pixels saved as palettized BMP and GIF keep every one of their 256 levels.
+    const std::wstring gray = TempPath(L"gray.png");
+    if (FAILED(WriteImage(wic, gray, GUID_ContainerFormatPng, GUID_WICPixelFormat8bppGray, 300, 200, 0, rng))) {
+        Fail("can't write a gray test image", 0);
+    } else {
+        const std::vector<BYTE> want = WicUpright(wic, gray, 1, w, h);
+        for (const wchar_t* ext : {L".bmp", L".gif"}) {
+            const std::wstring saved = TempPath((std::wstring(L"gray") + ext).c_str());
+            UINT sw = 0, sh = 0;
+            if (FAILED(SaveImage(Source{gray}, saved)) || want.empty() || WicUpright(wic, saved, 1, sw, sh) != want) {
+                Fail("gray pixels changed when saved palettized", ext[1]);
+            }
+            DeleteFileW(saved.c_str());
+        }
+    }
+    DeleteFileW(gray.c_str());
 }
 
 // An image the decoded bitmap holds exactly, as a pasted one then stands in for its data, saves with every pixel
@@ -475,6 +494,26 @@ void TestClipboardName() {
     if (!ImageNameOf(longName).empty()) Fail("name longer than a file name accepted", 0);
 }
 
+// A pasted PNG ends with its IEND chunk, whatever follows it in the clipboard's memory.
+void TestPngLength() {
+    std::vector<BYTE> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    const auto chunk = [&](const char* type, UINT length) {
+        const BYTE header[8] = {BYTE(length >> 24), BYTE(length >> 16), BYTE(length >> 8), BYTE(length),
+                                BYTE(type[0]), BYTE(type[1]), BYTE(type[2]), BYTE(type[3])};
+        png.insert(png.end(), header, header + 8);
+        png.insert(png.end(), length + 4, 0);  // data and CRC
+    };
+    chunk("IHDR", 13);
+    chunk("IDAT", 300);
+    if (PngLength(png.data(), png.size()) != png.size()) Fail("PNG without IEND not kept whole", 0);
+    chunk("IEND", 0);
+    const SIZE_T length = png.size();
+    png.insert(png.end(), 16, 0xCC);  // slack after the data
+    if (PngLength(png.data(), png.size()) != length) Fail("PNG not trimmed after IEND", int(png.size()));
+    png[8 + 8 + 13 + 4 + 3] = 0xFF;  // an IDAT length that runs past the data
+    if (PngLength(png.data(), png.size()) != png.size()) Fail("PNG with a bad chunk length trimmed", 0);
+}
+
 // Each frame is drawn over the last, after undoing it as its disposal asks: 2 clears to the background, 3
 // restores what was there, and transparent pixels leave the canvas as it is.
 void TestAnimationDisposal() {
@@ -487,12 +526,12 @@ void TestAnimationDisposal() {
     a.stride = kStride;
     a.bits = canvas;
     const auto frame = [](RECT rect, BYTE disposal, int transparent, size_t offset) {
-        Frame f{rect, 100, disposal, transparent, offset, {}};
-        f.colors[1] = kRed;
-        f.colors[2] = kGreen;
-        f.colors[3] = kBlue;
-        return f;
+        return Frame{rect, 100, disposal, transparent, offset, 0};
     };
+    a.palettes.resize(1);
+    a.palettes[0][1] = kRed;
+    a.palettes[0][2] = kGreen;
+    a.palettes[0][3] = kBlue;
     a.frames = {frame({0, 0, 4, 2}, 0, -1, 0), frame({1, 0, 3, 1}, 3, -1, 8), frame({0, 1, 1, 2}, 2, -1, 10),
                 frame({3, 1, 4, 2}, 0, 0, 11)};
     a.pixels = AllocPages<BYTE>(12);
@@ -539,6 +578,7 @@ int main() {
     TestClipboardDib();
     TestClipboardFiles();
     TestClipboardName();
+    TestPngLength();
     TestAnimationDisposal();
     CoUninitialize();
     printf(failures ? "%d failed\n" : "all passed\n", failures);

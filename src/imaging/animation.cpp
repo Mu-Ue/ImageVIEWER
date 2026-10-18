@@ -78,12 +78,12 @@ HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Anima
     ComPtr<IWICPalette> palette;
     hr = wic->CreatePalette(&palette);
     if (FAILED(hr)) return hr;
-    std::vector<ComPtr<IWICBitmapFrameDecode>> decoded(count);
     std::vector<Frame> frames(count);
-    UINT64 total = 0, budget = 0;  // index bytes, and those plus the frames' own size
+    std::vector<GifPalette> palettes;
+    UINT64 total = 0, budget = 0;  // index bytes, and those plus the frames' and palettes' own size
     size_t saved = 0;
     for (UINT i = 0; i < count; ++i) {
-        ComPtr<IWICBitmapFrameDecode>& frame = decoded[i];
+        ComPtr<IWICBitmapFrameDecode> frame;
         WICPixelFormatGUID format;
         UINT w = 0, h = 0;
         ComPtr<IWICMetadataQueryReader> meta;
@@ -94,12 +94,25 @@ HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Anima
         if (SUCCEEDED(hr)) hr = frame->GetMetadataQueryReader(&meta);
         if (SUCCEEDED(hr)) hr = frame->CopyPalette(palette.Get());
         Frame& f = frames[i];
-        UINT colors = 0;
-        if (SUCCEEDED(hr)) hr = palette->GetColors(256, f.colors, &colors);
+        GifPalette colors{};
+        UINT used = 0;
+        if (SUCCEEDED(hr)) hr = palette->GetColors(256, colors.data(), &used);
         if (SUCCEEDED(hr) && stopped()) hr = E_ABORT;
         if (FAILED(hr)) return hr;
-        std::fill(f.colors + colors, f.colors + 256, 0u);
-        for (UINT32& c : f.colors) c &= 0xFFFFFF;
+        std::fill(colors.begin() + used, colors.end(), 0u);
+        for (UINT32& c : colors) c &= 0xFFFFFF;
+        // Most frames use the global color table, so frames share a palette equal to one of the last few.
+        f.palette = UINT(palettes.size());
+        for (size_t k = palettes.size(); k-- > 0 && k + 8 >= palettes.size();) {
+            if (palettes[k] == colors) {
+                f.palette = UINT(k);
+                break;
+            }
+        }
+        if (f.palette == palettes.size()) {
+            palettes.push_back(colors);
+            budget += sizeof(GifPalette);
+        }
 
         // Frame positions and sizes are 16-bit, so these sums cannot overflow.
         const UINT left = ReadUint(meta.Get(), L"/imgdesc/Left", 0), top = ReadUint(meta.Get(), L"/imgdesc/Top", 0);
@@ -121,17 +134,21 @@ HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Anima
 
     Pages<BYTE> pixels = AllocPages<BYTE>(std::max<size_t>(1, size_t(total)));
     if (!pixels) return E_OUTOFMEMORY;
+    // The frames are fetched again rather than kept from above, which would hold thousands of them at once.
     for (UINT i = 0; i < count; ++i) {
         const Frame& f = frames[i];
         const UINT w = UINT(Width(f.rect)), h = UINT(Height(f.rect));
         if (w == 0 || h == 0) continue;
         const WICRect rect{0, 0, INT(w), INT(h)};  // clipping only ever trims the right and bottom
-        hr = decoded[i]->CopyPixels(&rect, w, w * h, pixels.get() + f.offset);
+        ComPtr<IWICBitmapFrameDecode> frame;
+        hr = decoder->GetFrame(i, &frame);
+        if (SUCCEEDED(hr)) hr = frame->CopyPixels(&rect, w, w * h, pixels.get() + f.offset);
         if (SUCCEEDED(hr) && stopped()) hr = E_ABORT;
         if (FAILED(hr)) return hr;
     }
 
     out.frames = std::move(frames);
+    out.palettes = std::move(palettes);
     out.pixels = std::move(pixels);
     out.saved.resize(saved);
     out.current = 0;
@@ -171,11 +188,12 @@ UINT ShowFrame(Animation& a, size_t i) {
         }
     }
     const BYTE* in = a.pixels.get() + f.offset;
+    const GifPalette& colors = a.palettes[f.palette];
     for (LONG y = f.rect.top; y < f.rect.bottom; ++y) {
         BYTE* d = row(f.rect, y);
         for (LONG x = f.rect.left; x < f.rect.right; ++x, ++in, d += 3) {
             if (*in == f.transparent) continue;
-            const UINT32 c = f.colors[*in];
+            const UINT32 c = colors[*in];
             d[0] = BYTE(c);
             d[1] = BYTE(c >> 8);
             d[2] = BYTE(c >> 16);

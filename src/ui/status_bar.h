@@ -4,6 +4,10 @@
 
 #include <string>
 
+// Has Windows read the icon font on another thread, so the first paint of the buttons doesn't wait for it
+// (about a millisecond). Call it as early as possible.
+void PreloadStatusIcons();
+
 // Creates the dark bar across the bottom of parent's client area, sized for parent's DPI. It shows the image
 // info and the previous/next buttons, which arrive at parent as WM_COMMAND kCmdPrevious and kCmdNext.
 HWND CreateStatusBar(HWND parent, HINSTANCE instance);

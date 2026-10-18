@@ -80,6 +80,16 @@ HRESULT WriteOptions(IPropertyBag2* options, const GUID& container) {
     return count ? options->Write(count, names, values) : S_OK;
 }
 
+// Replaces source with its pixels in memory, unless it is in memory already, so reading it more than once
+// decodes it only once.
+HRESULT Buffer(IWICImagingFactory* wic, ComPtr<IWICBitmapSource>& source) {
+    ComPtr<IWICBitmap> bitmap;
+    if (SUCCEEDED(source.As(&bitmap))) return S_OK;
+    const HRESULT hr = wic->CreateBitmapFromSource(source.Get(), WICBitmapCacheOnLoad, &bitmap);
+    if (SUCCEEDED(hr)) source = bitmap;
+    return hr;
+}
+
 // Whether pixels in format can be transparent.
 bool HasAlpha(IWICImagingFactory* wic, const WICPixelFormatGUID& format) {
     ComPtr<IWICComponentInfo> info;
@@ -124,8 +134,17 @@ HRESULT ToIndexed(IWICImagingFactory* wic, IWICBitmapSource* source, bool alpha,
                   ComPtr<IWICBitmapSource>& out) {
     ComPtr<IWICPalette> palette;
     ComPtr<IWICFormatConverter> indexed;
-    HRESULT hr = wic->CreatePalette(&palette);
-    if (SUCCEEDED(hr)) hr = palette->InitializeFromBitmap(source, alpha ? 255 : 256, FALSE);
+    ComPtr<IWICBitmapSource> buffered = source;  // read for the palette, the indices and the alpha
+    HRESULT hr = Buffer(wic, buffered);
+    source = buffered.Get();
+    WICPixelFormatGUID format{};
+    if (SUCCEEDED(hr)) hr = source->GetPixelFormat(&format);
+    if (SUCCEEDED(hr)) hr = wic->CreatePalette(&palette);
+    if (SUCCEEDED(hr)) {
+        // Every gray has its own entry, which a palette made from the pixels would not guarantee.
+        hr = format == GUID_WICPixelFormat8bppGray ? palette->InitializePredefined(WICBitmapPaletteTypeFixedGray256, FALSE)
+                                                   : palette->InitializeFromBitmap(source, alpha ? 255 : 256, FALSE);
+    }
     if (SUCCEEDED(hr)) hr = wic->CreateFormatConverter(&indexed);
     if (SUCCEEDED(hr)) {
         hr = indexed->Initialize(source, GUID_WICPixelFormat8bppIndexed, WICBitmapDitherTypeNone, palette.Get(),
@@ -205,9 +224,9 @@ HRESULT Encode(IWICImagingFactory* wic, IWICBitmapSource* source, IStream* strea
     if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
     ComPtr<IWICBitmapSource> pixels = source;
     if (SUCCEEDED(hr) && format == GUID_WICPixelFormat8bppIndexed && format != sourceFormat) {
-        hr = ToIndexed(wic, source, HasAlpha(wic, sourceFormat), frame.Get(), pixels);
+        hr = ToIndexed(wic, source, CanBeTransparent(wic, source), frame.Get(), pixels);
     } else if (SUCCEEDED(hr) && format != sourceFormat) {
-        if (HasAlpha(wic, sourceFormat) && !HasAlpha(wic, format)) hr = OverWhite(wic, source, pixels);
+        if (!HasAlpha(wic, format) && CanBeTransparent(wic, source)) hr = OverWhite(wic, source, pixels);
         // Same as WICConvertBitmapSource, without linking windowscodecs.dll into every launch.
         ComPtr<IWICFormatConverter> converter;
         if (SUCCEEDED(hr)) hr = wic->CreateFormatConverter(&converter);
@@ -323,6 +342,7 @@ HRESULT EncodeClipboardImage(const Source& src, HGLOBAL& png, HGLOBAL& dib) {
     ComPtr<IWICBitmapSource> source;
     UINT width = 0, height = 0;
     if (SUCCEEDED(hr)) hr = OpenSource(wic.Get(), src, 0, source, width, height);
+    if (SUCCEEDED(hr)) hr = Buffer(wic.Get(), source);  // read for the PNG and for the DIB
     ComPtr<IStream> stream;
     HGLOBAL encoded = nullptr;
     if (SUCCEEDED(hr)) hr = CreateStreamOnHGlobal(nullptr, FALSE, &stream);

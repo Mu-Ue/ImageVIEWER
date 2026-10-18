@@ -46,6 +46,18 @@ SIZE_T MeasureDib(const BYTE* data, SIZE_T size, UINT64& offset) {
     return total <= size ? SIZE_T(total) : 0;
 }
 
+// The length of the PNG that data starts with, up to the end of its IEND chunk, or size if it has none there.
+// Clipboard data can be longer than what was put on it.
+SIZE_T PngLength(const BYTE* data, SIZE_T size) {
+    for (SIZE_T at = 8; size - at >= 12;) {  // length, type and CRC of the next chunk fit
+        const UINT64 end = at + 12 + (UINT64(data[at]) << 24 | data[at + 1] << 16 | data[at + 2] << 8 | data[at + 3]);
+        if (end > size) break;
+        if (memcmp(data + at + 4, "IEND", 4) == 0) return SIZE_T(end);
+        at = SIZE_T(end);
+    }
+    return size;
+}
+
 // Copies the open clipboard's image data into a stream: PNG if offered, else the DIB as a BMP file.
 HRESULT CopyImageData(UINT format, Microsoft::WRL::ComPtr<IStream>& out) {
     const bool png = format != CF_DIB;
@@ -57,7 +69,11 @@ HRESULT CopyImageData(UINT format, Microsoft::WRL::ComPtr<IStream>& out) {
     HRESULT hr = size > kMaxBytes ? WINCODEC_ERR_IMAGESIZEOUTOFRANGE : S_OK;
     BITMAPFILEHEADER file{};
     if (SUCCEEDED(hr) && png) {
-        if (size < 8 || memcmp(p, "\x89PNG\r\n\x1A\n", 8) != 0) hr = WINCODEC_ERR_UNKNOWNIMAGEFORMAT;
+        if (size < 8 || memcmp(p, "\x89PNG\r\n\x1A\n", 8) != 0) {
+            hr = WINCODEC_ERR_UNKNOWNIMAGEFORMAT;
+        } else {
+            size = PngLength(p, size);
+        }
     } else if (SUCCEEDED(hr)) {
         // Wrap the DIB in a BMP file header so the BMP decoder can read it.
         UINT64 offset = 0;
@@ -89,10 +105,16 @@ HRESULT CopyImageData(UINT format, Microsoft::WRL::ComPtr<IStream>& out) {
             }
             GlobalUnlock(copy);
             hr = CreateStreamOnHGlobal(copy, TRUE, &out);
+            if (SUCCEEDED(hr)) {
+                copy = nullptr;  // the stream owns it
+                // The stream starts as large as the memory, which may be larger than asked for.
+                hr = out->SetSize({.QuadPart = header + size});
+                if (FAILED(hr)) out.Reset();
+            }
         } else {
             hr = E_OUTOFMEMORY;
         }
-        if (FAILED(hr)) GlobalFree(copy);
+        if (copy) GlobalFree(copy);
     }
     GlobalUnlock(data);
     return hr;
@@ -207,7 +229,8 @@ HRESULT ReadClipboardImage(HWND owner, Source& out, std::wstring& name, UINT64& 
     HRESULT hr = S_FALSE;
     if (IsClipboardFormatAvailable(PngFormat())) {
         hr = CopyImageData(PngFormat(), out.stream);
-        if (hr == S_OK) pngBytes = GlobalSize(GetClipboardData(PngFormat()));
+        STATSTG stat;
+        if (hr == S_OK && SUCCEEDED(out.stream->Stat(&stat, STATFLAG_NONAME))) pngBytes = stat.cbSize.QuadPart;
         name = L"Pasted image.png";
     } else if (IsClipboardFormatAvailable(CF_DIB)) {
         hr = CopyImageData(CF_DIB, out.stream);

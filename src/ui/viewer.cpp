@@ -333,9 +333,16 @@ void ShowError(HRESULT hr, const std::wstring& name) {
     MessageBoxW(g.hwnd, message.c_str(), kAppName, MB_OK | MB_ICONERROR);
 }
 
-// Shows a decoded image, replacing the current one. bytes is the size of a pasted image's compressed data, if
-// known; a file's size is read from the file.
-void SetImage(const Image& image, std::wstring name, UINT64 bytes = 0) {
+// The size of the file at path, or 0 if it can't be read. Asked on the decoding thread, as a slow share may
+// take a while to answer.
+UINT64 FileSize(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA file;
+    if (path.empty() || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &file)) return 0;
+    return UINT64(file.nFileSizeHigh) << 32 | file.nFileSizeLow;
+}
+
+// Shows a decoded image, replacing the current one. bytes is the size of its file or compressed data, if known.
+void SetImage(const Image& image, std::wstring name, UINT64 bytes) {
     SelectObject(g.imageDC, image.bitmap);
     if (g.image.bitmap) DeleteObject(g.image.bitmap);
     g.image = image;
@@ -347,10 +354,6 @@ void SetImage(const Image& image, std::wstring name, UINT64 bytes = 0) {
     g.imageW = float(image.width);
     g.imageH = float(image.height);
     g.resolution = std::to_wstring(image.fullWidth) + L" × " + std::to_wstring(image.fullHeight);
-    WIN32_FILE_ATTRIBUTE_DATA file;
-    if (!g.source.path.empty() && GetFileAttributesExW(g.source.path.c_str(), GetFileExInfoStandard, &file)) {
-        bytes = UINT64(file.nFileSizeHigh) << 32 | file.nFileSizeLow;
-    }
     g.size = bytes ? FormatSize(bytes) : L"";
     g.zoom = FitZoom();
     g.fit = true;
@@ -386,7 +389,7 @@ struct Decode {
     Ask ask;
     Source src;
     std::wstring name;
-    UINT64 bytes;  // the compressed size of a pasted image, if known
+    UINT64 bytes;  // the size of the file or of a pasted image's compressed data, if known
     HRESULT hr = E_FAIL;
     Image image;
     bool animated = false;  // image is the first frame of an animated GIF, whose Frames follow
@@ -444,6 +447,7 @@ void RunDecoder() {
             } else {
                 if (id == worker.latest) {
                     d->hr = FAILED(com) ? com : DecodeImage(d->src, d->image, &d->animated, &worker.waiting);
+                    if (SUCCEEDED(d->hr) && !d->src.path.empty()) d->bytes = FileSize(d->src.path);
                 }
                 animate = SUCCEEDED(d->hr) && d->animated;
                 if (id != worker.latest || !PostMessageW(g.hwnd, kDecodedMessage, 0, LPARAM(d))) {
@@ -455,7 +459,9 @@ void RunDecoder() {
             // request interrupts.
             if (animate && SUCCEEDED(com) && id == worker.latest) {
                 auto* const f = new Frames{id};
-                if (FAILED(DecodeAnimation(src, f->animation, worker.waiting)) ||
+                // Frames that can't be read arrive as none, so the window stops asking for them; frames that a
+                // new request interrupted don't arrive, so the window asks again.
+                if (DecodeAnimation(src, f->animation, worker.waiting) == E_ABORT ||
                     !PostMessageW(g.hwnd, kFramesMessage, 0, LPARAM(f))) {
                     delete f;
                 }
@@ -639,11 +645,19 @@ HRESULT RunModal(Work work) {
     return hr;
 }
 
+// What a save or copy reads: the source, plus the bitmap shown when it holds every source pixel, so it is read
+// instead of decoding the source again.
+Source ShownSource() {
+    Source src = g.source;
+    if (g.image.exact) src.bitmap = g.image.bitmap;
+    return src;
+}
+
 void SaveAs() {
     if (!g.image.bitmap) return;
     const std::wstring path = RunFileDialog(g.hwnd, L"save", g.name);
     if (path.empty()) return;
-    const HRESULT hr = RunModal([src = g.source, &path] { return SaveImage(src, path); });
+    const HRESULT hr = RunModal([src = ShownSource(), &path] { return SaveImage(src, path); });
     if (FAILED(hr) && hr != E_ABORT) {
         const std::wstring message = L"Can't save \"" + path + L"\".\n\n" + OrCode(FileErrorReason(hr), hr);
         MessageBoxW(g.hwnd, message.c_str(), kAppName, MB_OK | MB_ICONERROR);
@@ -682,7 +696,7 @@ void ToggleFullscreen() {
 void Copy() {
     if (!g.image.bitmap) return;
     HGLOBAL png = nullptr, dib = nullptr;
-    const HRESULT hr = RunModal([src = g.source, &png, &dib] { return EncodeClipboardImage(src, png, dib); });
+    const HRESULT hr = RunModal([src = ShownSource(), &png, &dib] { return EncodeClipboardImage(src, png, dib); });
     if (hr == E_ABORT) {
         if (png) GlobalFree(png);
         if (dib) GlobalFree(dib);
@@ -750,9 +764,11 @@ void OnDecoded(Decode* d) {
 void OnFrames(Frames* f) {
     Animation& a = f->animation;
     DIBSECTION ds{};
-    if (f->id == g.shownId && g.awaitingFrames &&
-        GetObjectW(g.image.bitmap, sizeof(ds), &ds) == sizeof(ds) && ds.dsBm.bmBitsPixel == 24 &&
-        UINT(ds.dsBm.bmWidth) == a.width && UINT(ds.dsBm.bmHeight) == a.height) {
+    const bool awaited = f->id == g.shownId && g.awaitingFrames;
+    if (awaited && a.frames.empty()) {
+        g.awaitingFrames = false;  // they can't be read, so the first frame stays
+    } else if (awaited && GetObjectW(g.image.bitmap, sizeof(ds), &ds) == sizeof(ds) && ds.dsBm.bmBitsPixel == 24 &&
+               UINT(ds.dsBm.bmWidth) == a.width && UINT(ds.dsBm.bmHeight) == a.height) {
         a.bits = static_cast<BYTE*>(ds.dsBm.bmBits);
         a.stride = UINT(ds.dsBm.bmWidthBytes);
         g.animation = std::move(a);
@@ -1010,16 +1026,21 @@ HANDLE FrameTimer() {
 }
 
 bool StartViewer(HINSTANCE instance, std::wstring path, int showCmd) {
+    PreloadStatusIcons();
     g.source.path = FullPath(path);
     g.name = FileName(g.source.path);
 
     // Decode on a worker thread while the window is set up.
     Image image;
     bool animated = false;
+    UINT64 bytes = 0;
     HRESULT decodeHr = S_OK;
     std::thread decoder;
     if (!g.source.path.empty()) {
-        decoder = ComThread(decodeHr, [&] { return DecodeImage(g.source, image, &animated); });
+        decoder = ComThread(decodeHr, [&] {
+            bytes = FileSize(g.source.path);
+            return DecodeImage(g.source, image, &animated);
+        });
     }
 
     g.hwnd = CreateMainWindow(instance);
@@ -1035,7 +1056,7 @@ bool StartViewer(HINSTANCE instance, std::wstring path, int showCmd) {
     // High resolution timers need Windows 10 1803; older versions pace pans less precisely.
     if (!g.frameTimer) g.frameTimer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
     if (!g.imageDC || !g.frameTimer) return false;
-    if (image.bitmap) SetImage(image, g.name);
+    if (image.bitmap) SetImage(image, g.name, bytes);
     if (animated) {
         g.awaitingFrames = true;
         RequestFrames();

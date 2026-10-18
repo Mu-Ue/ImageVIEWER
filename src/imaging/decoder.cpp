@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <span>
 #include <type_traits>
 
 #include "config.h"
@@ -13,11 +14,23 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-// Reads the EXIF orientation tag, if any.
-int ReadOrientation(IWICBitmapFrameDecode* frame) {
+// Reads the EXIF orientation tag, if any, from where the container keeps it. The first query costs about a
+// millisecond, so containers WIC reads no orientation from (PNG, GIF, BMP) skip it, and JPEG and TIFF skip the
+// path the other one uses.
+int ReadOrientation(IWICBitmapFrameDecode* frame, const GUID& container) {
+    static constexpr const wchar_t* kQueries[] = {L"/app1/ifd/{ushort=274}", L"/ifd/{ushort=274}"};
+    std::span<const wchar_t* const> queries = kQueries;
+    if (container == GUID_ContainerFormatJpeg) {
+        queries = queries.first(1);
+    } else if (container == GUID_ContainerFormatTiff) {
+        queries = queries.last(1);
+    } else if (container == GUID_ContainerFormatPng || container == GUID_ContainerFormatGif ||
+               container == GUID_ContainerFormatBmp) {
+        return 1;
+    }
     ComPtr<IWICMetadataQueryReader> reader;
     if (FAILED(frame->GetMetadataQueryReader(&reader))) return 1;
-    for (const wchar_t* query : {L"/app1/ifd/{ushort=274}", L"/ifd/{ushort=274}"}) {
+    for (const wchar_t* query : queries) {
         PROPVARIANT value;
         PropVariantInit(&value);
         if (SUCCEEDED(reader->GetMetadataByName(query, &value))) {
@@ -42,7 +55,8 @@ UINT BitsPerPixel(IWICImagingFactory* wic, IWICBitmapSource* source) {
     return 0;
 }
 
-// Whether any pixel of the source can be less than fully opaque.
+}  // namespace
+
 bool CanBeTransparent(IWICImagingFactory* wic, IWICBitmapSource* source) {
     WICPixelFormatGUID format;
     ComPtr<IWICComponentInfo> info;
@@ -62,6 +76,8 @@ bool CanBeTransparent(IWICImagingFactory* wic, IWICBitmapSource* source) {
     }
     return true;
 }
+
+namespace {
 
 // Icons hold several sizes and frame 0 is often the smallest, so pick the largest, deepest one.
 HRESULT GetFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, ComPtr<IWICBitmapFrameDecode>& out) {
@@ -260,6 +276,35 @@ HRESULT SniffStream(IStream* stream, const GUID*& format) {
     return format ? S_OK : WINCODEC_ERR_UNKNOWNIMAGEFORMAT;
 }
 
+// The decoder Windows has built in for a container, or null for those installed separately (HEIF, WebP).
+const CLSID* BuiltInDecoder(const GUID& container) {
+    static const struct {
+        const GUID& container;
+        const CLSID& decoder;
+    } kDecoders[] = {
+        {GUID_ContainerFormatJpeg, CLSID_WICJpegDecoder}, {GUID_ContainerFormatPng, CLSID_WICPngDecoder},
+        {GUID_ContainerFormatGif, CLSID_WICGifDecoder},   {GUID_ContainerFormatBmp, CLSID_WICBmpDecoder},
+        {GUID_ContainerFormatTiff, CLSID_WICTiffDecoder}, {GUID_ContainerFormatIco, CLSID_WICIcoDecoder},
+        {GUID_ContainerFormatWmp, CLSID_WICWmpDecoder},
+    };
+    for (const auto& d : kDecoders) {
+        if (d.container == container) return &d.decoder;
+    }
+    return nullptr;
+}
+
+// Makes a built-in decoder straight from windowscodecs.dll, which the factory has loaded. Asking the factory
+// instead would first look through every installed codec, which takes longer than opening a small image.
+HRESULT CreateBuiltInDecoder(const CLSID& clsid, ComPtr<IWICBitmapDecoder>& out) {
+    const HMODULE module = GetModuleHandleW(L"windowscodecs.dll");
+    const auto getClassObject =
+        module ? reinterpret_cast<decltype(&DllGetClassObject)>(GetProcAddress(module, "DllGetClassObject")) : nullptr;
+    ComPtr<IClassFactory> factory;
+    HRESULT hr = getClassObject ? getClassObject(clsid, IID_PPV_ARGS(&factory)) : E_NOINTERFACE;
+    if (SUCCEEDED(hr)) hr = factory->CreateInstance(nullptr, IID_PPV_ARGS(&out));
+    return hr;
+}
+
 // Creates the decoder for the format the data starts with, and only that one: data is never handed
 // to a codec for a different format than it claims to be, and anything else is rejected.
 HRESULT CreateDecoder(IWICImagingFactory* wic, IStream* stream, ComPtr<IWICBitmapDecoder>& out) {
@@ -268,7 +313,9 @@ HRESULT CreateDecoder(IWICImagingFactory* wic, IStream* stream, ComPtr<IWICBitma
     if (FAILED(hr)) return hr;
 
     ComPtr<IWICBitmapDecoder> decoder;
-    hr = wic->CreateDecoder(*format, &GUID_VendorMicrosoft, &decoder);
+    const CLSID* builtIn = BuiltInDecoder(*format);
+    hr = builtIn ? CreateBuiltInDecoder(*builtIn, decoder) : E_NOINTERFACE;
+    if (FAILED(hr)) hr = wic->CreateDecoder(*format, &GUID_VendorMicrosoft, &decoder);
     if (SUCCEEDED(hr)) hr = decoder->Initialize(stream, WICDecodeMetadataCacheOnDemand);
     if (SUCCEEDED(hr)) out = decoder;
     return hr;
@@ -303,6 +350,110 @@ HRESULT DecodeFirstFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Im
     out.height = out.fullHeight = a.height;
     out.exact = false;  // the canvas changes as it plays
     return S_OK;
+}
+
+constexpr UINT64 kMinBandPixels = 1 << 20;  // smaller JPEGs decode sooner than extra threads start
+constexpr UINT kMaxBands = 4;  // later bands spend most of their time reading past the rows above
+
+// Whether a JPEG frame's scans each hold every component, so a decoder can produce a band of rows after reading
+// past the data above it. A progressive JPEG has to be decoded whole for any band.
+bool IsInterleavedJpeg(IWICBitmapSource* frame) {
+    ComPtr<IWICJpegFrameDecode> jpeg;
+    WICJpegFrameHeader header{};
+    return SUCCEEDED(frame->QueryInterface(IID_PPV_ARGS(&jpeg))) && SUCCEEDED(jpeg->GetFrameHeader(&header)) &&
+           header.ScanType == WICJpegScanTypeInterleaved;
+}
+
+// Rows [y0, y1) of an opaque 8-bit color JPEG, decoded through a decoder of its own into the 24bpp bitmap, as
+// DecodeImage does: straight in when upright, else through a strip placed as place says.
+struct Band {
+    IWICImagingFactory* wic;
+    const Source* src;
+    UINT width, y0, y1;
+    const Placement* place;
+    bool sideways, direct;
+    BYTE* bits;
+    UINT stride24;
+    const std::atomic<bool>* stop;
+    HRESULT hr = E_FAIL;
+};
+
+HRESULT DecodeBand(const Band& b) {
+    Source own{b.src->path};  // a stream is cloned, so each band reads at its own position
+    HRESULT hr = b.src->stream ? b.src->stream->Clone(&own.stream) : S_OK;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICFormatConverter> converter;
+    if (SUCCEEDED(hr)) hr = OpenDecoder(b.wic, own, decoder);
+    if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, &frame);
+    if (SUCCEEDED(hr)) hr = b.wic->CreateFormatConverter(&converter);
+    if (SUCCEEDED(hr)) {
+        hr = converter->Initialize(frame.Get(), b.direct ? GUID_WICPixelFormat24bppBGR : GUID_WICPixelFormat32bppPBGRA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    }
+    const UINT stripStride = b.width * 4;
+    const UINT rows = std::clamp((1u << 20) / stripStride, 1u, std::max(1u, b.y1 - b.y0));
+    const Pages<BYTE> strip = b.direct ? nullptr : AllocPages<BYTE>(size_t(stripStride) * rows);
+    if (SUCCEEDED(hr) && !b.direct && !strip) hr = E_OUTOFMEMORY;
+    for (UINT y0 = b.y0; y0 < b.y1 && SUCCEEDED(hr); y0 += rows) {
+        if (b.stop && b.stop->load()) return E_ABORT;
+        const UINT n = std::min(rows, b.y1 - y0);
+        const WICRect rect{0, INT(y0), INT(b.width), INT(n)};
+        if (b.direct) {
+            hr = converter->CopyPixels(&rect, b.stride24, b.stride24 * n, b.bits + size_t(y0) * b.stride24);
+            continue;
+        }
+        hr = converter->CopyPixels(&rect, stripStride, stripStride * n, strip.get());
+        if (FAILED(hr)) break;
+        ForEachPixel<3>(b.width, y0, y0 + n, *b.place, b.sideways, [&](size_t i, ptrdiff_t at) {
+            const BYTE* p = strip.get() + i * 4;
+            BYTE* d = b.bits + at;
+            d[0] = p[0];
+            d[1] = p[1];
+            d[2] = p[2];
+            return true;
+        });
+    }
+    return hr;
+}
+
+// Decodes a large JPEG in bands on several cores, this thread taking the first. Each band reads past the data of
+// the rows above it, at a bit under half the cost of decoding them, so each band is about 0.57 times as tall as
+// the one above for all to finish together.
+HRESULT DecodeBands(Band base, UINT height) {
+    const UINT count = std::clamp(UINT(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 1u, kMaxBands);
+    double weights[kMaxBands], total = 0;
+    for (UINT k = 0; k < count; ++k) total += weights[k] = k ? weights[k - 1] * 0.57 : 1.0;
+    Band bands[kMaxBands];
+    HANDLE threads[kMaxBands] = {};
+    double above = 0;
+    for (UINT k = 0; k < count; ++k) {
+        bands[k] = base;
+        bands[k].y0 = k ? bands[k - 1].y1 : 0;
+        above += weights[k];
+        // Edges fall on 16-row boundaries, the tallest a JPEG's blocks of rows can be.
+        bands[k].y1 = k + 1 == count ? height : std::max(bands[k].y0, std::min(height, UINT(height * above / total) & ~15u));
+        if (k == 0 || bands[k].y0 == bands[k].y1) continue;
+        threads[k] = CreateThread(nullptr, 0, [](void* p) -> DWORD {
+            Band& b = *static_cast<Band*>(p);
+            const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            b.hr = DecodeBand(b);
+            if (SUCCEEDED(com)) CoUninitialize();
+            return 0;
+        }, &bands[k], 0, nullptr);
+    }
+    HRESULT hr = bands[0].hr = DecodeBand(bands[0]);
+    for (UINT k = 1; k < count; ++k) {
+        if (bands[k].y0 == bands[k].y1) continue;
+        if (threads[k]) {
+            WaitForSingleObject(threads[k], INFINITE);
+            CloseHandle(threads[k]);
+        } else {
+            bands[k].hr = DecodeBand(bands[k]);  // no thread: decode it here
+        }
+        if (SUCCEEDED(hr)) hr = bands[k].hr;
+    }
+    return hr;
 }
 
 }  // namespace
@@ -361,7 +512,9 @@ HRESULT OpenDecoded(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT ma
         WICBitmapTransformOptions(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal),
         WICBitmapTransformRotate270,
     };
-    const int exif = ReadOrientation(frame.Get());
+    GUID container{};
+    decoder->GetContainerFormat(&container);
+    const int exif = ReadOrientation(frame.Get(), container);
     if (orientation) {
         *orientation = exif;
     } else if (exif != 1) {
@@ -381,7 +534,7 @@ HRESULT OpenDecoded(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT ma
 }  // namespace
 
 HRESULT OpenEncoded(const Source& src, ComPtr<IStream>& stream, GUID& format) {
-    if (src.bitmap) return E_INVALIDARG;
+    if (!src.stream && src.path.empty()) return E_INVALIDARG;
     stream = src.stream;
     HRESULT hr = stream ? S_OK : OpenFileStream(src.path, stream);
     const GUID* sniffed = nullptr;
@@ -466,6 +619,7 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
     UINT width = 0, height = 0;  // of the source, before orientation is applied
     SIZE full{};  // the same, before scaling down
     int orientation = 1;
+    GUID container{};
     if (src.bitmap) {
         hr = OpenSource(wic.Get(), src, kMaxBitmapSize, source, width, height, &full, &orientation);
     } else {
@@ -475,6 +629,7 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
             *animated = true;
             return S_OK;
         }
+        if (SUCCEEDED(hr)) hr = decoder->GetContainerFormat(&container);
         if (SUCCEEDED(hr)) {
             hr = OpenDecoded(wic.Get(), decoder.Get(), kMaxBitmapSize, source, width, height, &full, &orientation);
         }
@@ -483,6 +638,8 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
     WICPixelFormatGUID format{};
     source->GetPixelFormat(&format);
     const bool transparent = CanBeTransparent(wic.Get(), source.Get());
+    // A color JPEG all but never has 256 colors or fewer, so it goes straight to 24bpp without counting them.
+    const bool countColors = container != GUID_ContainerFormatJpeg || format != GUID_WICPixelFormat24bppBGR;
 
     ComPtr<IWICFormatConverter> converter;
     hr = wic->CreateFormatConverter(&converter);
@@ -499,7 +656,7 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
     const UINT stripStride = width * 4;
     const UINT rows = std::clamp((1u << 20) / stripStride, 1u, height);
     const Pages<BYTE> strip = AllocPages<BYTE>(size_t(stripStride) * rows);
-    Pages<BYTE> indices = AllocPages<BYTE>(size_t(width) * height);
+    Pages<BYTE> indices = countColors ? AllocPages<BYTE>(size_t(width) * height) : nullptr;
     if (!strip) return E_OUTOFMEMORY;
 
     const UINT stride24 = (outW * 3 + 3) & ~3u;
@@ -514,10 +671,25 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
 
     // Once 24bpp, upright opaque 8-bit sources are decoded straight into the bitmap: same bytes, no copy.
     const bool canDecodeDirect = orientation == 1 && !transparent && Is8BitColor(format);
+    // A large color JPEG shown at full size decodes in bands on several cores instead of the loop below.
+    const bool inBands = !countColors && !transparent && UINT(full.cx) == width && UINT(full.cy) == height &&
+                         UINT64(width) * height >= kMinBandPixels && IsInterleavedJpeg(source.Get());
+    if (inBands) {
+        hr = DecodeBands({wic.Get(), &src, width, 0, 0, &place24, sideways, canDecodeDirect, bits, stride24, stop},
+                         height);
+    }
     ComPtr<IWICFormatConverter> direct;
+    const auto startDirect = [&] {
+        if (canDecodeDirect && SUCCEEDED(wic->CreateFormatConverter(&direct)) &&
+            FAILED(direct->Initialize(source.Get(), GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, nullptr,
+                                      0.0, WICBitmapPaletteTypeCustom))) {
+            direct.Reset();
+        }
+    };
+    if (!indices && !inBands) startDirect();
     const UINT bg = kBackground & 0xFF;  // gray: all channels equal
     BYTE alpha = 255;  // AND of all alpha values: 255 if nothing is transparent
-    for (UINT y0 = 0; y0 < height; y0 += rows) {
+    for (UINT y0 = inBands ? height : 0; y0 < height; y0 += rows) {
         if (stop && stop->load()) {
             hr = E_ABORT;
             break;
@@ -591,12 +763,7 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
             d[2] = p[2];
             return true;
         });
-        if (canDecodeDirect &&
-            SUCCEEDED(wic->CreateFormatConverter(&direct)) &&
-            FAILED(direct->Initialize(source.Get(), GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone,
-                                      nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
-            direct.Reset();
-        }
+        startDirect();
     }
     if (FAILED(hr)) {
         if (bitmap) DeleteObject(bitmap);

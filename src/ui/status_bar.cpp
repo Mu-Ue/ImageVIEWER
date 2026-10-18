@@ -27,6 +27,17 @@ struct {
     bool enabled = false;
 } status;
 
+// The font the chevrons are drawn in, at a height in pixels.
+LOGFONTW IconFont(int height) {
+    LOGFONTW icons{};
+    icons.lfHeight = -height;
+    icons.lfWeight = FW_NORMAL;
+    icons.lfCharSet = DEFAULT_CHARSET;
+    icons.lfQuality = CLEARTYPE_QUALITY;
+    wcscpy_s(icons.lfFaceName, L"Segoe MDL2 Assets");
+    return icons;
+}
+
 // The fields, or the message instead while one is set.
 std::span<const std::wstring> Shown() {
     return status.message.empty() ? std::span<const std::wstring>(status.fields) : std::span(&status.message, 1);
@@ -156,6 +167,23 @@ LRESULT CALLBACK StatusProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
+void PreloadStatusIcons() {
+    // GDI calls only: a thread's first USER call sets it up for windows, which would cost about as much again.
+    const HANDLE thread = CreateThread(nullptr, 0, [](void*) -> DWORD {
+        const HDC dc = CreateCompatibleDC(nullptr);
+        const LOGFONTW icons = IconFont(10);
+        const HFONT font = CreateFontIndirectW(&icons);
+        const HGDIOBJ old = SelectObject(dc, font);
+        SIZE size;
+        GetTextExtentPoint32W(dc, kChevrons[0], 1, &size);  // reads the font file
+        SelectObject(dc, old);
+        DeleteObject(font);
+        DeleteDC(dc);
+        return 0;
+    }, nullptr, 0, nullptr);
+    if (thread) CloseHandle(thread);
+}
+
 HWND CreateStatusBar(HWND parent, HINSTANCE instance) {
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = StatusProc;
@@ -177,12 +205,7 @@ void LayoutStatusBar(UINT dpi) {
     SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, dpi);
     if (status.font) DeleteObject(status.font);
     status.font = CreateFontIndirectW(&ncm.lfMenuFont);
-    LOGFONTW icons{};
-    icons.lfHeight = -MulDiv(10, dpi, 96);
-    icons.lfWeight = FW_NORMAL;
-    icons.lfCharSet = DEFAULT_CHARSET;
-    icons.lfQuality = CLEARTYPE_QUALITY;
-    wcscpy_s(icons.lfFaceName, L"Segoe MDL2 Assets");
+    const LOGFONTW icons = IconFont(MulDiv(10, dpi, 96));
     if (status.icons) DeleteObject(status.icons);
     status.icons = CreateFontIndirectW(&icons);
 

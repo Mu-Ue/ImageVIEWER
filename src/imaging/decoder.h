@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
-// Where an image comes from: a file, an in-memory copy of pasted data, or a decoded bitmap that holds
-// the exact source pixels (not owned).
+// Where an image comes from: a file, an in-memory copy of pasted data, or both of those or neither with a decoded
+// bitmap that holds the exact upright source pixels (not owned), which is then read instead of decoding them.
 struct Source {
     std::wstring path;
     Microsoft::WRL::ComPtr<IStream> stream;
@@ -51,8 +51,12 @@ HRESULT OpenSource(IWICImagingFactory* wic, const Source& src, UINT maxSize,
                    SIZE* full = nullptr, int* orientation = nullptr);
 
 // Opens the encoded data of a file or pasted source, rewound, and sets format to its container. Fails for a
-// decoded bitmap or data in a format this viewer doesn't open.
+// source that is only a decoded bitmap, or data in a format this viewer doesn't open.
 HRESULT OpenEncoded(const Source& src, Microsoft::WRL::ComPtr<IStream>& stream, GUID& format);
+
+// Whether any pixel of the source can be less than fully opaque: its format has alpha and, if it is
+// palettized, so does its palette.
+bool CanBeTransparent(IWICImagingFactory* wic, IWICBitmapSource* source);
 
 // Adds the ICC profiles of src's image to out, if it has any.
 void ReadColorProfiles(IWICImagingFactory* wic, const Source& src,
