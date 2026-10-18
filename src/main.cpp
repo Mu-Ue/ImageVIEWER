@@ -20,10 +20,10 @@ void HardenProcess() {
     SetProcessMitigationPolicy(ProcessImageLoadPolicy, &policy, sizeof(policy));
 }
 
-// Keeps AppInit DLLs, Winsock LSPs, global window hooks and legacy IMEs out of the viewer, ends it on
-// any use of an invalid handle, and loads fonts only from the Windows fonts folder (the viewer never loads
-// a font file itself). Not for the file dialog, which needs its shell extensions and IMEs. Dynamic code
-// stays allowed: codecs can reach GPU drivers, which may generate code.
+// Keeps AppInit DLLs, Winsock LSPs, global window hooks and legacy IMEs out of the viewer, and loads fonts
+// only from the Windows fonts folder (the viewer never loads a font file itself). Not for the file dialog,
+// which needs its shell extensions and IMEs. Dynamic code and invalid handles stay allowed: codecs can reach
+// GPU drivers, which may generate code or close a handle twice.
 void HardenViewer() {
     PROCESS_MITIGATION_FONT_DISABLE_POLICY fonts{};
     fonts.DisableNonSystemFonts = 1;
@@ -31,10 +31,6 @@ void HardenViewer() {
     PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY extensions{};
     extensions.DisableExtensionPoints = 1;
     SetProcessMitigationPolicy(ProcessExtensionPointDisablePolicy, &extensions, sizeof(extensions));
-    PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY handles{};
-    handles.RaiseExceptionOnInvalidHandleReference = 1;
-    handles.HandleExceptionsPermanentlyEnabled = 1;
-    SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, &handles, sizeof(handles));
 }
 
 std::wstring Unquote(const wchar_t* s) {
