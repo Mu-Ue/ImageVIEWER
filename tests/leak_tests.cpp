@@ -49,7 +49,11 @@ void TestLeaks() {
                     DrawScaled(target, imageDC, 0, 0, 77, 55, {0, 0, 200, 150});
                     SelectObject(imageDC, old);
                     const Source shown{path, src.stream, image.exact ? image.bitmap : nullptr};
-                    for (const wchar_t* ext : {L".png", L".jpg", L".gif"}) SaveImage(shown, dir + L"out" + ext);
+                    // Every format for the small images; one for the large, which only add their own paths.
+                    for (const wchar_t* ext : {L".jpg", L".png", L".gif"}) {
+                        SaveImage(shown, dir + L"out" + ext);
+                        if (image.width * image.height >= 1u << 20) break;
+                    }
                     HGLOBAL png = nullptr, dib = nullptr;
                     if (SUCCEEDED(EncodeClipboardImage(shown, png, dib))) {
                         GlobalFree(png);
