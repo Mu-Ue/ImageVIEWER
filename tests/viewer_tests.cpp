@@ -366,6 +366,29 @@ void TestNeighbors() {
         visited.push_back(at);
     }
     if (visited.back() != alike + L"z.png" || visited[0] == visited[1]) Fail("names that sort alike not both visited", 0);
+
+    // Whatever order the folder lists them in, an image's neighbors are the names next to it once sorted.
+    const std::wstring many = TempDir(L"many");
+    std::mt19937 rng(7);
+    std::vector<std::wstring> names;
+    for (int i = 0; i < 60; ++i) {
+        std::wstring name;
+        for (int k = 0, length = 1 + int(rng() % 5); k < length; ++k) name += L"aB3_x10Z"[rng() % 8];
+        name += L".png";
+        if (std::none_of(names.begin(), names.end(), [&](const std::wstring& other) { return SamePath(other, name); })) {
+            names.push_back(name);
+            WriteAll(many + name, {0});
+        }
+    }
+    std::sort(names.begin(), names.end(),
+              [](const std::wstring& a, const std::wstring& b) { return CompareNames(a.c_str(), b.c_str()) < 0; });
+    for (size_t i = 0; i < names.size(); ++i) {
+        Neighbors(many + names[i], around);
+        if (around[0] != many + names[(i + names.size() - 1) % names.size()] ||
+            around[1] != many + names[(i + 1) % names.size()]) {
+            Fail("wrong neighbors among many names", int(i));
+        }
+    }
 }
 
 // The viewer as the user drives it, on the hidden desktop: what it shows at every zoom and offset is exactly the

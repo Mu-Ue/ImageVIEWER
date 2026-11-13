@@ -33,8 +33,10 @@ Span Cover(UINT i, UINT src, UINT out) {
     return s;
 }
 
-// Adds w times each of n bytes to sums. Every weight fits in 16 bits for bitmaps up to 65535 pixels tall,
-// where SSE2's 16-bit multiplies give the full 32-bit products, 16 bytes at a time.
+// Adds w times each of n bytes to sums, or sets sums to that if Set, which saves clearing them first. Every weight
+// fits in 16 bits for bitmaps up to 65535 pixels tall, where SSE2's 16-bit multiplies give the full 32-bit products,
+// 16 bytes at a time.
+template <bool Set>
 void AddRow(const BYTE* p, size_t n, UINT32 w, UINT32* sums) {
     size_t i = 0;
 #if defined(_M_X64) || defined(_M_IX86)
@@ -47,13 +49,14 @@ void AddRow(const BYTE* p, size_t n, UINT32 w, UINT32* sums) {
                 const __m128i v = half ? _mm_unpackhi_epi8(bytes, zero) : _mm_unpacklo_epi8(bytes, zero);
                 const __m128i lo = _mm_mullo_epi16(v, weight), hi = _mm_mulhi_epu16(v, weight);
                 __m128i* const d = s + half * 2;
-                _mm_storeu_si128(d, _mm_add_epi32(_mm_loadu_si128(d), _mm_unpacklo_epi16(lo, hi)));
-                _mm_storeu_si128(d + 1, _mm_add_epi32(_mm_loadu_si128(d + 1), _mm_unpackhi_epi16(lo, hi)));
+                const __m128i first = _mm_unpacklo_epi16(lo, hi), second = _mm_unpackhi_epi16(lo, hi);
+                _mm_storeu_si128(d, Set ? first : _mm_add_epi32(_mm_loadu_si128(d), first));
+                _mm_storeu_si128(d + 1, Set ? second : _mm_add_epi32(_mm_loadu_si128(d + 1), second));
             }
         }
     }
 #endif
-    for (; i < n; ++i) sums[i] += w * p[i];
+    for (; i < n; ++i) sums[i] = (Set ? 0 : sums[i]) + w * p[i];
 }
 
 // round(sum / area), exactly: the floating-point estimate is off by at most one.
@@ -133,10 +136,9 @@ void RunChunks(Job& job) {
             }
             previous = s;
             // Totals stay below 2^32: the weights of an output row's source rows add up to the source height.
-            std::fill_n(sums, values, 0u);
-            for (UINT sy = s.first; sy <= s.last; ++sy) {
-                const UINT32 w = sy == s.first ? s.firstWeight : sy == s.last ? s.lastWeight : job.height;
-                AddRow(row(sy), values, w, sums);
+            AddRow<true>(row(s.first), values, s.firstWeight, sums);
+            for (UINT sy = s.first + 1; sy <= s.last; ++sy) {
+                AddRow<false>(row(sy), values, sy == s.last ? s.lastWeight : job.height, sums);
             }
             // When enlarging, neighboring columns often cover the same source pixels and come out the same.
             for (UINT c = 0; c < job.cols; ++c) {

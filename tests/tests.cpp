@@ -128,6 +128,7 @@ int wmain(int argc, wchar_t** argv) {
         {"icons", TestIcons},
         {"robustness", TestRobustness},
         {"concurrent decodes", TestConcurrentDecodes},
+        {"handle stream", TestHandleStream},
         {"animation disposal", TestAnimationDisposal},
         {"gif files", TestGifFiles},
         {"save", TestSave},

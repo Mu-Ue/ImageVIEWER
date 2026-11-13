@@ -144,6 +144,40 @@ Showing the window before the image is decoded would hide 1–15 ms more, but it
 
 **What's left:** process start, Windows setting up the UI thread, creating and showing the windows, and Windows' own work between the three windows' paints. Avoiding that last part would mean drawing the bars inside the main window instead of as their own windows. That would be a large change, and it would break what screen readers read out, so I left it.
 
+## I/O, palette and rotation pass (applied, uncommitted)
+
+**How it was checked:** a harness linked the repo's sources and hashed `DecodeImage`'s whole output (bits, palette and its order, size, `exact`) and `DrawScaled`'s output on 32 images: the JPEG, PNG, GIF, BMP, TIFF and JXR samples from before, plus gray JPEGs in orientations 3/6/8, small JPEGs in orientations 5/7, 16-level and 2-level gray PNGs, a 1-bit TIFF, a few-color alpha PNG, and 8bpp palette PNG/GIF/BMP/TIFF with see-through and half see-through entries. **All identical to the last commit.** A sampling profiler (DbgHelp on the decoding thread) found the hot spots. `tests.exe` passes, with a new `handle stream` group and a gray case in `orientation`.
+
+**Kept** (decode times warm, best of 9; launch = process start to everything painted, median of 63):
+
+| Change | Where | Measured (old → new) |
+|---|---|---|
+| The file stream seeks in user mode and reads at explicit offsets through a 64 KB buffer. BMP did a seek and a read per row (1,204 each), TIFF 1,879 seeks, and PNG and JPEG read about 4 KB at a time. Reads below the buffer, as bottom-up rows are read, fill the window below. | `handle_stream.cpp` | BMP 1080p 3.4 → 1.9 ms (launch 14.8 → 12.7), TIFF 18.3 → 17.2, PNG 3840 27.8 → 26.4, PNG alpha 12.0 → 11.3 |
+| 8bpp gray and palette sources are read as their bytes. Each of the 256 values is converted once, through a row of all 256 in the source's own format and palette, then composited and looked up. That skips WIC's expansion to 32bpp and a hash lookup per pixel. | `decoder.cpp` `ConvertValues`, `DecodeImage` | gray PNG 8.8 → 4.3 (launch 20.2 → 16.0), gray JPEG 6.0 → 2.4, gray rotated 4.5 → 2.1, GIF still 3.1 → 2.3, palette PNG 2.3 → 1.5, palette BMP 2.1 → 0.65, alpha palette PNG 1.3 → 0.63 (launch 9.4 → 8.7) |
+| Sideways (EXIF 5–8) copies walk each source column down the strip, so writes run along an upright row; band strips are 24bpp, since every band is opaque | `decoder.cpp` `CopyPlaced`, `DecodeBand` | 12 MP EXIF 6 16.8 → 13.7 (launch 29.5 → 26.8), EXIF 3 11.6 → 10.9 |
+| Upright palette counting compares runs of the last color four pixels at a time (SSE2); the last-color cache lives in `Palette`, so the loop no longer depends on what the compiler inlines into `DecodeImage` | `decoder.cpp` `StoreInOrder`, `Palette::Index` | screenshot PNG 2.05 → 1.85 |
+| The scaler sets the first source row's weighted values instead of clearing the totals and adding to them | `scale.cpp` `AddRow<Set>` | pan strip 4–5% faster (0.343 → 0.325 ms at 12 MP) |
+| The old bitmap is freed on the thread pool, not before the new one is painted | `viewer.cpp` `SetImage` | `DeleteObject` of a 12 MP bitmap is about 1.3 ms |
+| `Neighbors` skips comparisons that can't change the result, and tests the end NTFS listing order moves toward first: two `CompareStringEx` per file instead of three in a sorted listing | `viewer.cpp` `Neighbors` | same order; new randomized test against a sort |
+| The decoder thread starts before the icon-font thread | `viewer.cpp` `StartViewer` | decode starts about 0.05 ms sooner (near noise; free) |
+
+**Measured and dropped:**
+
+| Idea | Result |
+|---|---|
+| Mapping the file instead of buffering | BMP/TIFF/JXR faster, but small PNGs and GIFs 0.25 ms slower (view setup and teardown), and page faults leave BMP at 3.4 ms, against 1.9 ms with the buffer |
+| Taller strips (4 or 8 MB) for sideways copies | no change |
+| Packing four sideways pixels into three 32-bit writes | slower (14.3 vs 13.7 ms) |
+| Touching the bitmap's pages before the bands | no change: the faults don't contend |
+| First band reading the already open frame instead of its own decoder | no change: band 1 then finishes last |
+| Signalling the startup decode early and unloading WIC and COM in the background | `ShowWindow` gets slower by as much (loader lock); painted time unchanged |
+| Building the popup menus on first open | 0.02 ms |
+| `/Gw /Gy` | same exe size under LTCG |
+
+**Measuring note:** a ±0.25 ms difference on a 2 ms decode can flip between process runs of the same two builds (address layout), so compare medians over several processes. When `DecodeImage` grows, check with the profiler that the per-pixel code is still inlined.
+
+**What's left at startup:** before a decode starts, 0.5 ms of thread start, 0.6–0.7 ms of `CoInitializeEx` and 0.5 ms to load WIC and make its factory; then WIC's own decode, about 0.85 ms of `ShowWindow`, and the first paint.
+
 ## 1. Critical: bugs, undefined behavior, security
 
 No undefined behavior or security hole survived verification. The one security candidate was disproved; it is listed at the end of this section so it isn't chased again.

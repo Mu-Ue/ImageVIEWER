@@ -345,7 +345,12 @@ UINT64 FileSize(const std::wstring& path) {
 // Shows a decoded image, replacing the current one. bytes is the size of its file or compressed data, if known.
 void SetImage(const Image& image, std::wstring name, UINT64 bytes) {
     SelectObject(g.imageDC, image.bitmap);
-    if (g.image.bitmap) DeleteObject(g.image.bitmap);
+    // Freeing a large bitmap takes a millisecond or more, so it is done off this thread, which paints the new one.
+    if (g.image.bitmap &&
+        !TrySubmitThreadpoolCallback([](PTP_CALLBACK_INSTANCE, void* old) { DeleteObject(HBITMAP(old)); },
+                                     g.image.bitmap, nullptr)) {
+        DeleteObject(g.image.bitmap);
+    }
     g.image = image;
     g.animation = {};
     g.awaitingFrames = false;
@@ -569,13 +574,25 @@ void Neighbors(const std::wstring& path, std::wstring (&around)[2]) {
         do {
             const wchar_t* f = fd.cFileName;
             if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !IsImageName(f) || SamePath(f, name)) continue;
+            // first <= before and after <= last, so a name past the top of its range can't be below it too. The top
+            // is checked first: NTFS lists names in about this order, so then one comparison settles each.
             const int c = CompareNames(f, name);
             if (c < 0) {
-                if (before.empty() || CompareNames(f, before.c_str()) > 0) before = f;
-                if (first.empty() || CompareNames(f, first.c_str()) < 0) first = f;
+                if (before.empty()) {
+                    before = first = f;
+                } else if (CompareNames(f, before.c_str()) > 0) {
+                    before = f;
+                } else if (CompareNames(f, first.c_str()) < 0) {
+                    first = f;
+                }
             } else if (c > 0) {
-                if (after.empty() || CompareNames(f, after.c_str()) < 0) after = f;
-                if (last.empty() || CompareNames(f, last.c_str()) > 0) last = f;
+                if (after.empty()) {
+                    after = last = f;
+                } else if (CompareNames(f, last.c_str()) > 0) {
+                    last = f;
+                } else if (CompareNames(f, after.c_str()) < 0) {
+                    after = f;
+                }
             }
         } while (FindNextFileW(find, &fd));
         FindClose(find);
@@ -1027,7 +1044,6 @@ HANDLE FrameTimer() {
 }
 
 bool StartViewer(HINSTANCE instance, std::wstring path, int showCmd) {
-    PreloadStatusIcons();
     g.source.path = FullPath(path);
     g.name = FileName(g.source.path);
 
@@ -1043,6 +1059,7 @@ bool StartViewer(HINSTANCE instance, std::wstring path, int showCmd) {
             return DecodeImage(g.source, image, &animated);
         });
     }
+    PreloadStatusIcons();  // after the decoder thread, which waits longest, so it starts first
 
     g.hwnd = CreateMainWindow(instance);
     if (decoder.joinable()) decoder.join();

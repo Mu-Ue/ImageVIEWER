@@ -5,6 +5,10 @@
 #include <span>
 #include <type_traits>
 
+#if defined(_M_X64) || defined(_M_IX86)
+#include <emmintrin.h>
+#endif
+
 #include "config.h"
 #include "imaging/animation.h"
 #include "platform/handle_stream.h"
@@ -143,6 +147,19 @@ struct Palette {
         colors[count] = color;
         return int(count++);
     }
+
+    // Find, through the color asked for last, which most pixels repeat.
+    int Index(UINT32 color) {
+        if (color != last) {
+            const int index = Find(color);
+            if (index < 0) return -1;
+            last = color;
+            lastIndex = BYTE(index);
+        }
+        return lastIndex;
+    }
+    UINT32 last = ~0u;
+    BYTE lastIndex = 0;
 };
 
 // Packs a row of palette indices at Bpp bits each, leftmost pixel in the high bits.
@@ -215,6 +232,89 @@ bool ForEachPixel(UINT width, UINT y0, UINT y1, const Placement& place, bool sid
     };
     // Upright rows, the common case, get a constant step the compiler can optimize for.
     return place.stepX == Pixel ? walk(std::integral_constant<ptrdiff_t, Pixel>{}) : walk(place.stepX);
+}
+
+// Stores the palette index of each of n 32bpp pixels that land in order at d, or returns false once the palette is
+// full. Runs of the color last stored, as screenshots and drawings have, are compared four pixels at a time.
+bool StoreInOrder(const BYTE* pixels, size_t n, Palette& palette, BYTE* d) {
+    const auto store = [&](size_t i) {
+        UINT32 color;
+        memcpy(&color, pixels + i * 4, 4);
+        const int index = palette.Index(color & 0xFFFFFF);
+        d[i] = BYTE(index);
+        return index >= 0;
+    };
+    size_t i = 0;
+#if defined(_M_X64) || defined(_M_IX86)
+    const __m128i rgb = _mm_set1_epi32(0xFFFFFF);
+    while (i + 4 <= n) {
+        const __m128i v = _mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pixels + i * 4)), rgb);
+        if (_mm_movemask_epi8(_mm_cmpeq_epi32(v, _mm_set1_epi32(int(palette.last)))) == 0xFFFF) {
+            memset(d + i, palette.lastIndex, 4);
+            i += 4;
+            continue;
+        }
+        for (const size_t end = i + 4; i < end; ++i) {
+            if (!store(i)) return false;
+        }
+    }
+#endif
+    for (; i < n; ++i) {
+        if (!store(i)) return false;
+    }
+    return true;
+}
+
+// Sets out to what each of the 256 values of an 8bpp gray or palette source converts to as 32bppPBGRA: a row of
+// every value, in the source's format and with its palette, is converted as its pixels would be.
+HRESULT ConvertValues(IWICImagingFactory* wic, IWICBitmapSource* source, const WICPixelFormatGUID& format,
+                      BYTE (&out)[256 * 4]) {
+    BYTE all[256];
+    for (UINT v = 0; v < 256; ++v) all[v] = BYTE(v);
+    ComPtr<IWICBitmap> row;
+    ComPtr<IWICPalette> palette;
+    ComPtr<IWICFormatConverter> converter;
+    HRESULT hr = wic->CreateBitmapFromMemory(256, 1, format, 256, 256, all, &row);
+    if (SUCCEEDED(hr) && format == GUID_WICPixelFormat8bppIndexed) {
+        hr = wic->CreatePalette(&palette);
+        if (SUCCEEDED(hr)) hr = source->CopyPalette(palette.Get());
+        if (SUCCEEDED(hr)) hr = row->SetPalette(palette.Get());
+    }
+    if (SUCCEEDED(hr)) hr = wic->CreateFormatConverter(&converter);
+    if (SUCCEEDED(hr)) {
+        hr = converter->Initialize(row.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom);
+    }
+    if (SUCCEEDED(hr)) hr = converter->CopyPixels(nullptr, sizeof(out), sizeof(out), out);
+    return hr;
+}
+
+// Copies rows [y0, y1) of a strip of In-byte BGR(A) pixels, width per row, to where they land in a 24bpp bitmap.
+// A sideways image is copied a source column at a time, which lands along an upright row: the writes then run in
+// order, and the strip rows they read stay in cache.
+template <size_t In>
+void CopyPlaced(const BYTE* strip, UINT width, UINT y0, UINT y1, const Placement& place, bool sideways, BYTE* bits) {
+    if (!sideways) {
+        ForEachPixel<3>(width, y0, y1, place, false, [&](size_t i, ptrdiff_t at) {
+            const BYTE* p = strip + i * In;
+            BYTE* d = bits + at;
+            d[0] = p[0];
+            d[1] = p[1];
+            d[2] = p[2];
+            return true;
+        });
+        return;
+    }
+    const size_t rowBytes = size_t(width) * In;
+    for (UINT x = 0; x < width; ++x) {
+        const BYTE* p = strip + size_t(x) * In;
+        BYTE* d = bits + place.origin + ptrdiff_t(x) * place.stepX + ptrdiff_t(y0) * place.stepY;
+        for (UINT y = y0; y < y1; ++y, p += rowBytes, d += place.stepY) {
+            d[0] = p[0];
+            d[1] = p[1];
+            d[2] = p[2];
+        }
+    }
 }
 
 // Whether converting the format to 8-bit BGRA keeps every pixel's value.
@@ -387,10 +487,10 @@ HRESULT DecodeBand(const Band& b) {
     if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, &frame);
     if (SUCCEEDED(hr)) hr = b.wic->CreateFormatConverter(&converter);
     if (SUCCEEDED(hr)) {
-        hr = converter->Initialize(frame.Get(), b.direct ? GUID_WICPixelFormat24bppBGR : GUID_WICPixelFormat32bppPBGRA,
-                                   WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
+        hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom);
     }
-    const UINT stripStride = b.width * 4;
+    const UINT stripStride = b.width * 3;
     const UINT rows = std::clamp((1u << 20) / stripStride, 1u, std::max(1u, b.y1 - b.y0));
     const Pages<BYTE> strip = b.direct ? nullptr : AllocPages<BYTE>(size_t(stripStride) * rows);
     if (SUCCEEDED(hr) && !b.direct && !strip) hr = E_OUTOFMEMORY;
@@ -403,15 +503,7 @@ HRESULT DecodeBand(const Band& b) {
             continue;
         }
         hr = converter->CopyPixels(&rect, stripStride, stripStride * n, strip.get());
-        if (FAILED(hr)) break;
-        ForEachPixel<3>(b.width, y0, y0 + n, *b.place, b.sideways, [&](size_t i, ptrdiff_t at) {
-            const BYTE* p = strip.get() + i * 4;
-            BYTE* d = b.bits + at;
-            d[0] = p[0];
-            d[1] = p[1];
-            d[2] = p[2];
-            return true;
-        });
+        if (SUCCEEDED(hr)) CopyPlaced<3>(strip.get(), b.width, y0, y0 + n, *b.place, b.sideways, b.bits);
     }
     return hr;
 }
@@ -639,31 +731,60 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
     const bool transparent = CanBeTransparent(wic.Get(), source.Get());
     // A color JPEG all but never has 256 colors or fewer, so it goes straight to 24bpp without counting them.
     const bool countColors = container != GUID_ContainerFormatJpeg || format != GUID_WICPixelFormat24bppBGR;
-
-    ComPtr<IWICFormatConverter> converter;
-    hr = wic->CreateFormatConverter(&converter);
-    if (SUCCEEDED(hr)) {
-        hr = converter->Initialize(source.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
-                                   nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    const UINT bg = kBackground & 0xFF;  // gray: all channels equal
+    // Composites transparent 32bpp pixels over the background once, so painting is a plain blit, and ANDs their
+    // alpha into alpha.
+    const auto composite = [bg](BYTE* p, const BYTE* end, BYTE& alpha) {
+        for (; p != end; p += 4) {
+            alpha &= p[3];
+            const UINT inverse = 255u - p[3];
+            if (inverse == 0) continue;
+            const BYTE add = BYTE((bg * inverse + 127) / 255);
+            p[0] = BYTE(p[0] + add);
+            p[1] = BYTE(p[1] + add);
+            p[2] = BYTE(p[2] + add);
+        }
+    };
+    // An 8bpp gray or palette image has at most 256 colors, so it is read as stored, a byte per pixel, and each
+    // value is converted and looked up in the palette once.
+    BYTE values[256 * 4];  // each value as 32bpp, composited if transparent
+    const bool byValue = (format == GUID_WICPixelFormat8bppGray || format == GUID_WICPixelFormat8bppIndexed) &&
+                         SUCCEEDED(ConvertValues(wic.Get(), source.Get(), format, values));
+    if (byValue && transparent) {
+        BYTE unused = 255;
+        composite(values, values + sizeof(values), unused);
     }
-    if (FAILED(hr)) return hr;
 
-    // Decode in strips through a small 32bpp buffer and store the exact pixels upright, in the smallest
+    ComPtr<IWICBitmapSource> reader = source;  // what the strips are read from
+    if (!byValue) {
+        ComPtr<IWICFormatConverter> converter;
+        hr = wic->CreateFormatConverter(&converter);
+        if (SUCCEEDED(hr)) {
+            hr = converter->Initialize(source.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr,
+                                       0.0, WICBitmapPaletteTypeCustom);
+        }
+        if (FAILED(hr)) return hr;
+        reader = converter;
+    }
+
+    // Decode in strips through a small buffer and store the exact pixels upright, in the smallest
     // form: palette indices while the image has <= 256 colors, otherwise 24bpp (alpha is composited away).
     const bool sideways = orientation >= 5;
     const UINT outW = sideways ? height : width, outH = sideways ? width : height;
-    const UINT stripStride = width * 4;
-    const UINT rows = std::clamp((1u << 20) / stripStride, 1u, height);
+    const UINT stripStride = width * (byValue ? 1 : 4);
+    // As many rows as 1 MB of 32bpp holds, whatever the strip holds: a sideways image's palette is in the order
+    // its colors first appear in each strip.
+    const UINT rows = std::clamp((1u << 20) / (width * 4), 1u, height);
     const Pages<BYTE> strip = AllocPages<BYTE>(size_t(stripStride) * rows);
     Pages<BYTE> indices = countColors ? AllocPages<BYTE>(size_t(width) * height) : nullptr;
-    if (!strip) return E_OUTOFMEMORY;
+    if (!strip || (byValue && !indices)) return E_OUTOFMEMORY;  // a strip of values has no 24bpp to fall back on
 
     const UINT stride24 = (outW * 3 + 3) & ~3u;
     const Placement placeIndex = Place(orientation, width, height, 1, outW);
     const Placement place24 = Place(orientation, width, height, 3, stride24);
     Palette palette;
-    UINT32 lastColor = ~0u;
-    BYTE lastIndex = 0;
+    int known[256];  // palette index of each value, -1 until seen
+    std::fill_n(known, 256, -1);
     BYTE* bits = nullptr;
     HBITMAP bitmap = indices ? nullptr : CreateDib(outW, outH, 24, nullptr, 0, bits);
     if (!indices && !bitmap) return E_OUTOFMEMORY;
@@ -686,7 +807,6 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
         }
     };
     if (!indices && !inBands) startDirect();
-    const UINT bg = kBackground & 0xFF;  // gray: all channels equal
     BYTE alpha = 255;  // AND of all alpha values: 255 if nothing is transparent
     for (UINT y0 = inBands ? height : 0; y0 < height; y0 += rows) {
         if (stop && stop->load()) {
@@ -700,39 +820,42 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
             if (FAILED(hr)) break;
             continue;
         }
-        hr = converter->CopyPixels(&rect, stripStride, stripStride * n, strip.get());
+        hr = reader->CopyPixels(&rect, stripStride, stripStride * n, strip.get());
         if (FAILED(hr)) break;
         BYTE* const begin = strip.get();
         BYTE* const end = begin + size_t(stripStride) * n;
 
-        // Composite transparent pixels over the background once, so painting is a plain blit; sources
-        // that cannot be transparent skip this.
-        for (BYTE* p = transparent ? begin : end; p != end; p += 4) {
-            alpha &= p[3];
-            const UINT inverse = 255u - p[3];
-            if (inverse == 0) continue;
-            const BYTE add = BYTE((bg * inverse + 127) / 255);
-            p[0] = BYTE(p[0] + add);
-            p[1] = BYTE(p[1] + add);
-            p[2] = BYTE(p[2] + add);
+        if (byValue) {
+            BYTE* const dst = indices.get();
+            ForEachPixel<1>(width, y0, y0 + n, placeIndex, sideways, [&](size_t i, ptrdiff_t at) {
+                const BYTE v = begin[i];
+                if (known[v] < 0) {
+                    UINT32 color;
+                    memcpy(&color, values + v * 4, 4);
+                    known[v] = palette.Find(color & 0xFFFFFF);  // never full: 256 values at most
+                    if (transparent) alpha &= values[v * 4 + 3];
+                }
+                dst[at] = BYTE(known[v]);
+                return true;
+            });
+            continue;
         }
+        if (transparent) composite(begin, end, alpha);  // sources that can't be transparent skip this
 
         if (indices) {
             BYTE* const dst = indices.get();
+            const size_t first = size_t(y0) * width;  // where an upright strip starts
             const auto store = [&](size_t i, ptrdiff_t at) {
                 UINT32 color;
                 memcpy(&color, begin + i * 4, 4);
-                color &= 0xFFFFFF;
-                if (color != lastColor) {
-                    const int index = palette.Find(color);
-                    if (index < 0) return false;
-                    lastColor = color;
-                    lastIndex = BYTE(index);
-                }
-                dst[at] = lastIndex;
-                return true;
+                const int index = palette.Index(color & 0xFFFFFF);
+                dst[at] = BYTE(index);
+                return index >= 0;
             };
-            if (ForEachPixel<1>(width, y0, y0 + n, placeIndex, sideways, store)) continue;
+            if (orientation == 1 ? StoreInOrder(begin, size_t(width) * n, palette, dst + first)
+                                 : ForEachPixel<1>(width, y0, y0 + n, placeIndex, sideways, store)) {
+                continue;
+            }
 
             // More than 256 colors: switch to 24bpp, expanding the rows stored so far.
             bitmap = CreateDib(outW, outH, 24, nullptr, 0, bits);
@@ -754,14 +877,7 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
             indices.reset();
         }
 
-        ForEachPixel<3>(width, y0, y0 + n, place24, sideways, [&](size_t i, ptrdiff_t at) {
-            const BYTE* p = begin + i * 4;
-            BYTE* d = bits + at;
-            d[0] = p[0];
-            d[1] = p[1];
-            d[2] = p[2];
-            return true;
-        });
+        CopyPlaced<4>(begin, width, y0, y0 + n, place24, sideways, bits);
         startDirect();
     }
     if (FAILED(hr)) {

@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "imaging/decoder.h"
+#include "platform/handle_stream.h"
 #include "test.h"
 
 namespace {
@@ -119,6 +120,8 @@ void TestOrientation() {
                  // Over a million pixels, so it is decoded in bands on several threads.
                  {GUID_ContainerFormatJpeg, GUID_WICPixelFormat24bppBGR, L".jpg", 7000, 0},
                  {GUID_ContainerFormatTiff, GUID_WICPixelFormat8bppIndexed, L".tif", 97, 0},
+                 // Read a byte per pixel, as gray.
+                 {GUID_ContainerFormatJpeg, GUID_WICPixelFormat8bppGray, L".jpg", 97, 0},
                  // Decoded in strips of 1747 rows, so the colors run out in the second one.
                  {GUID_ContainerFormatTiff, GUID_WICPixelFormat24bppBGR, L".tif", 4000, 2000}};
     for (int k = 0; k < int(std::size(kinds)); ++k) {
@@ -735,4 +738,73 @@ void TestConcurrentDecodes() {
     for (std::thread& t : threads) t.join();
     if (wrong) Fail("concurrent decodes gave different pixels", wrong);
     for (const std::wstring& path : paths) DeleteFileW(path.c_str());
+}
+
+// The stream decoders read files through serves reads and seeks from its buffer exactly as the file holds them:
+// in any order, across the buffer's edges, past the end, and after writes.
+void TestHandleStream() {
+    std::mt19937 rng(41);
+    std::vector<BYTE> data(300000);
+    for (BYTE& b : data) b = BYTE(rng());
+    const std::wstring path = TempPath(L"stream.bin");
+    if (!WriteAll(path, data)) return Fail("can't write the stream test file", 0);
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    ComPtr<IStream> stream;
+    if (file == INVALID_HANDLE_VALUE || FAILED(CreateHandleStream(file, stream))) {
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        return Fail("can't open a stream on the test file", 0);
+    }
+    std::vector<BYTE> got(200000);
+    LONGLONG pos = 0;
+    for (int i = 0; i < 3000; ++i) {
+        const DWORD origin = rng() % 3;
+        const LONGLONG base = origin == STREAM_SEEK_SET ? 0 : origin == STREAM_SEEK_CUR ? pos : LONGLONG(data.size());
+        const LONGLONG to = LONGLONG(rng() % (data.size() + 2000));  // sometimes past the end
+        ULARGE_INTEGER at{};
+        if (FAILED(stream->Seek({.QuadPart = to - base}, origin, &at)) || LONGLONG(at.QuadPart) != to) {
+            return Fail("stream seek lands in the wrong place", i);
+        }
+        // Mostly small reads, as decoders make, some larger than the buffer.
+        const ULONG size = rng() % 8 ? rng() % 6000 : rng() % ULONG(got.size());
+        ULONG read = 0;
+        const HRESULT hr = stream->Read(got.data(), size, &read);
+        const ULONG want = ULONG(std::clamp<LONGLONG>(LONGLONG(data.size()) - to, 0, size));
+        if (FAILED(hr) || read != want || (hr == S_OK) != (want == size) ||
+            !std::equal(got.begin(), got.begin() + read, data.begin() + to)) {
+            return Fail("stream read differs from the file", i);
+        }
+        pos = to + read;
+        // Rows stored bottom-up are read from the end backwards.
+        if (i % 500 == 0) {
+            LONGLONG row = LONGLONG(data.size()) - 5760;
+            for (; row >= 0; row -= 5760) {
+                if (FAILED(stream->Seek({.QuadPart = row}, STREAM_SEEK_SET, nullptr)) ||
+                    FAILED(stream->Read(got.data(), 5760, &read)) || read != 5760 ||
+                    !std::equal(got.begin(), got.begin() + 5760, data.begin() + row)) {
+                    return Fail("stream reads backwards wrongly", int(row));
+                }
+            }
+            pos = row + 5760 + 5760;  // where the last read, one row up, ended
+        }
+    }
+    ULARGE_INTEGER at{};
+    if (stream->Seek({.QuadPart = -1}, STREAM_SEEK_SET, &at) != HRESULT_FROM_WIN32(ERROR_NEGATIVE_SEEK)) {
+        Fail("stream seeks before the start", 0);
+    }
+    // A write replaces what a later read returns, even where the buffer held the old bytes.
+    ULONG n = 0;
+    stream->Seek({.QuadPart = 1000}, STREAM_SEEK_SET, nullptr);
+    stream->Read(got.data(), 100, &n);
+    const BYTE patch[50] = {1, 2, 3};
+    stream->Seek({.QuadPart = 1020}, STREAM_SEEK_SET, nullptr);
+    if (FAILED(stream->Write(patch, sizeof(patch), &n)) || n != sizeof(patch)) Fail("stream write fails", 0);
+    std::copy(std::begin(patch), std::end(patch), data.begin() + 1020);
+    stream->Seek({.QuadPart = 1000}, STREAM_SEEK_SET, nullptr);
+    if (FAILED(stream->Read(got.data(), 100, &n)) || n != 100 || !std::equal(got.begin(), got.begin() + 100, data.begin() + 1000)) {
+        Fail("stream read after a write returns stale bytes", 0);
+    }
+    STATSTG stat{};
+    if (FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart != data.size()) Fail("stream size is wrong", 0);
+    stream.Reset();
+    DeleteFileW(path.c_str());
 }

@@ -152,6 +152,7 @@ void TestBands();
 void TestIcons();
 void TestRobustness();
 void TestConcurrentDecodes();
+void TestHandleStream();
 void TestAnimationDisposal();
 void TestGifFiles();
 void TestSave();
