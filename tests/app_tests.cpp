@@ -175,6 +175,19 @@ void TestApp() {
         }
     }
 
+    // A photo tagged with the usual sRGB profile opens without loading the color engine.
+    {
+        const std::wstring tagged = dir + L"srgb.jpg";
+        EncodeFile(tagged, GUID_ContainerFormatJpeg, GradientBitmap(64, 48).Get(), nullptr, 1, SrgbProfile().Get());
+        App app(L"\"" + tagged + L"\"");
+        const HWND main = app.Main();
+        if (!main || WindowText(main) != L"srgb.jpg") Fail("sRGB-tagged photo didn't open", 0);
+        if (app.Loaded(L"mscms.dll")) Fail("sRGB-tagged photo loaded the color engine", 0);
+        PostMessageW(main, WM_KEYDOWN, VK_ESCAPE, 0);
+        app.ExitCode();
+        DeleteFileW(tagged.c_str());
+    }
+
     // Started without an image, it shows an empty window.
     {
         App app(L"");

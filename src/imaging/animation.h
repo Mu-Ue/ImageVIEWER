@@ -33,6 +33,13 @@ struct Animation {
     UINT width = 0, height = 0, stride = 0;
 };
 
+// The size of a GIF's canvas: its logical screen, grown to fit frame 0 (first) as browsers do for files that
+// claim a smaller one. Frame positions and sizes are 16-bit, so it never exceeds 131070 a side.
+HRESULT GifCanvas(IWICBitmapDecoder* decoder, IWICBitmapFrameDecode* first, UINT& width, UINT& height);
+
+// Where a GIF frame starts on the canvas.
+POINT GifFrameOffset(IWICBitmapFrameDecode* frame);
+
 // Reads every frame of a GIF decoder with more than one, or only the first if firstOnly. Fails if it has
 // fewer, or is too large to play, and gives up with E_ABORT once stop is set.
 HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Animation& out, bool firstOnly,

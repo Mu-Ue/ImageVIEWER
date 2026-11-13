@@ -341,6 +341,41 @@ void TestDecodeSources() {
     for (const std::wstring& path : {png, misnamed, jpgAsPng}) DeleteFileW(path.c_str());
 }
 
+// HEIC, through the codec Windows installs from the Store: shown as its decoder presents it, which already turns
+// it as the file's rotation and mirror boxes say, and not turned again. Skipped where that codec isn't installed.
+void TestHeif() {
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (FAILED(Wic()->CreateEncoder(GUID_ContainerFormatHeif, nullptr, &encoder))) return;
+    int id = 0;
+    for (const int orientation : {1, 3, 6, 8}) {
+        for (const bool alpha : {false, true}) {
+            ++id;
+            const std::wstring path = TempPath(L"heif" + std::to_wstring(id) + L".heic");
+            const WICPixelFormatGUID format = alpha ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat24bppBGR;
+            if (FAILED(EncodeFile(path, GUID_ContainerFormatHeif, GradientBitmap(96, 40, alpha).Get(), &format,
+                                  orientation))) {
+                Fail("can't write a HEIC", id);
+                continue;
+            }
+            UINT w = 0, h = 0;
+            const ComPtr<IWICBitmapFrameDecode> frame = WicFrame(path);
+            if (!frame || FAILED(frame->GetSize(&w, &h)) || (orientation >= 5 ? w != 40 : w != 96)) {
+                Fail("HEIC's decoder doesn't turn it as its rotation box says", id);
+            }
+            Image image;
+            if (FAILED(DecodeImage(Source{path}, image))) {
+                Fail("HEIC didn't open", id);
+                continue;
+            }
+            if (image.width != w || image.height != h || DibPixels(image.bitmap) != Shown(path)) {
+                Fail("HEIC shown turned or wrong", id);
+            }
+            DeleteObject(image.bitmap);
+            DeleteFileW(path.c_str());
+        }
+    }
+}
+
 // The format comes from the data's first bytes alone, and only data in a format the viewer opens is read.
 void TestSniffing() {
     const auto sniff = [](const std::string& head, GUID& format) {

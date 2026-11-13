@@ -20,7 +20,8 @@ namespace {
 
 // Reads the EXIF orientation tag, if any, from where the container keeps it. The first query costs about a
 // millisecond, so containers WIC reads no orientation from (PNG, GIF, BMP) skip it, and JPEG and TIFF skip the
-// path the other one uses.
+// path the other one uses. HEIF's decoder turns the image as its own rotation and mirror boxes say, which the
+// format puts above any EXIF tag, so the tag isn't read: applying it as well would turn the image twice.
 int ReadOrientation(IWICBitmapFrameDecode* frame, const GUID& container) {
     static constexpr const wchar_t* kQueries[] = {L"/app1/ifd/{ushort=274}", L"/ifd/{ushort=274}"};
     std::span<const wchar_t* const> queries = kQueries;
@@ -29,7 +30,7 @@ int ReadOrientation(IWICBitmapFrameDecode* frame, const GUID& container) {
     } else if (container == GUID_ContainerFormatTiff) {
         queries = queries.last(1);
     } else if (container == GUID_ContainerFormatPng || container == GUID_ContainerFormatGif ||
-               container == GUID_ContainerFormatBmp) {
+               container == GUID_ContainerFormatBmp || container == GUID_ContainerFormatHeif) {
         return 1;
     }
     ComPtr<IWICMetadataQueryReader> reader;
@@ -451,8 +452,12 @@ HRESULT DecodeFirstFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Im
     return S_OK;
 }
 
+bool ToSrgb(IWICImagingFactory* wic, IWICBitmapFrameDecode* frame, ComPtr<IWICBitmapSource>& source);
+
 constexpr UINT64 kMinBandPixels = 1 << 20;  // smaller JPEGs decode sooner than extra threads start
 constexpr UINT kMaxBands = 4;  // later bands spend most of their time reading past the rows above
+// Converting colors costs every band the same for its own rows, so more bands pay: measured best on 16 cores.
+constexpr UINT kMaxConvertingBands = 8;
 
 // Whether a JPEG frame's scans each hold every component, so a decoder can produce a band of rows after reading
 // past the data above it. A progressive JPEG has to be decoded whole for any band.
@@ -470,7 +475,7 @@ struct Band {
     const Source* src;
     UINT width, y0, y1;
     const Placement* place;
-    bool sideways, direct;
+    bool sideways, direct, toSrgb;
     BYTE* bits;
     UINT stride24;
     const std::atomic<bool>* stop;
@@ -483,11 +488,14 @@ HRESULT DecodeBand(const Band& b) {
     ComPtr<IWICBitmapDecoder> decoder;
     ComPtr<IWICBitmapFrameDecode> frame;
     ComPtr<IWICFormatConverter> converter;
+    ComPtr<IWICBitmapSource> source;
     if (SUCCEEDED(hr)) hr = OpenDecoder(b.wic, own, decoder);
     if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, &frame);
+    if (SUCCEEDED(hr)) source = frame;
+    if (SUCCEEDED(hr) && b.toSrgb && !ToSrgb(b.wic, frame.Get(), source)) hr = E_FAIL;  // as the first decoder did
     if (SUCCEEDED(hr)) hr = b.wic->CreateFormatConverter(&converter);
     if (SUCCEEDED(hr)) {
-        hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, nullptr, 0.0,
+        hr = converter->Initialize(source.Get(), GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, nullptr, 0.0,
                                    WICBitmapPaletteTypeCustom);
     }
     const UINT stripStride = b.width * 3;
@@ -510,13 +518,15 @@ HRESULT DecodeBand(const Band& b) {
 
 // Decodes a large JPEG in bands on several cores, this thread taking the first. Each band reads past the data of
 // the rows above it, at a bit under half the cost of decoding them, so each band is about 0.57 times as tall as
-// the one above for all to finish together.
+// the one above for all to finish together; 0.9 when converting colors, which costs the same in every band.
 HRESULT DecodeBands(Band base, UINT height) {
-    const UINT count = std::clamp(UINT(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 1u, kMaxBands);
-    double weights[kMaxBands], total = 0;
-    for (UINT k = 0; k < count; ++k) total += weights[k] = k ? weights[k - 1] * 0.57 : 1.0;
-    Band bands[kMaxBands];
-    HANDLE threads[kMaxBands] = {};
+    const UINT count = std::clamp(UINT(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 1u,
+                                  base.toSrgb ? kMaxConvertingBands : kMaxBands);
+    const double shrink = base.toSrgb ? 0.9 : 0.57;
+    double weights[kMaxConvertingBands], total = 0;
+    for (UINT k = 0; k < count; ++k) total += weights[k] = k ? weights[k - 1] * shrink : 1.0;
+    Band bands[kMaxConvertingBands];
+    HANDLE threads[kMaxConvertingBands] = {};
     double above = 0;
     for (UINT k = 0; k < count; ++k) {
         bands[k] = base;
@@ -569,19 +579,180 @@ WicFactory::~WicFactory() {
 
 namespace {
 
-// OpenSource for a source that isn't a bitmap, once its decoder is made.
-HRESULT OpenDecoded(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT maxSize,
-                    ComPtr<IWICBitmapSource>& source, UINT& width, UINT& height, SIZE* full, int* orientation) {
-    if (orientation) *orientation = 1;
+// All of a frame's color contexts: ICC profiles and EXIF color spaces.
+std::vector<ComPtr<IWICColorContext>> ColorContexts(IWICImagingFactory* wic, IWICBitmapFrameDecode* frame) {
+    UINT count = 0;
+    if (FAILED(frame->GetColorContexts(0, nullptr, &count)) || count == 0 || count > 16) return {};
+    std::vector<ComPtr<IWICColorContext>> contexts(count);
+    std::vector<IWICColorContext*> raw(count);
+    for (UINT i = 0; i < count; ++i) {
+        if (FAILED(wic->CreateColorContext(&contexts[i]))) return {};
+        raw[i] = contexts[i].Get();
+    }
+    if (FAILED(frame->GetColorContexts(count, raw.data(), &count))) return {};
+    contexts.resize(count);
+    return contexts;
+}
+
+bool IsProfile(IWICColorContext* context) {
+    WICColorContextType type;
+    return SUCCEEDED(context->GetType(&type)) && type == WICColorContextProfile;
+}
+
+// Whether converting from a profile to sRGB leaves 8-bit colors as they are, as it does for sRGB profiles. Tried on
+// every level of each channel and of gray, and a lattice of mixed colors; remembered for the next image.
+bool KeepsColors(IWICImagingFactory* wic, IWICColorContext* profile) {
+    UINT size = 0;
+    std::vector<BYTE> bytes;
+    if (FAILED(profile->GetProfileBytes(0, nullptr, &size)) || size == 0) return false;
+    bytes.resize(size);
+    if (FAILED(profile->GetProfileBytes(size, bytes.data(), &size))) return false;
+    UINT64 key = 1469598103934665603ull;  // FNV-1a
+    for (const BYTE b : bytes) key = (key ^ b) * 1099511628211ull;
+    // The IEC 61966-2.1 profile Windows ships, which most cameras and editors embed: known without loading the
+    // color engine to try it.
+    if (key == 0x5614E5C35A6D4122ull && size == 3144) return true;
+
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static struct {
+        UINT64 key;
+        bool keeps;
+    } known[8];
+    static UINT knownCount = 0;
+    AcquireSRWLockShared(&lock);
+    const auto found = std::find_if(known, known + std::min(knownCount, 8u), [&](const auto& k) { return k.key == key; });
+    const bool cached = found != known + std::min(knownCount, 8u);
+    const bool cachedKeeps = cached && found->keeps;
+    ReleaseSRWLockShared(&lock);
+    if (cached) return cachedKeeps;
+
+    std::vector<BYTE> probe;
+    probe.reserve((256 * 4 + 16 * 16 * 16) * 3);
+    for (UINT v = 0; v < 256; ++v) {
+        const BYTE b = BYTE(v);
+        for (const BYTE p : {b, BYTE(0), BYTE(0), BYTE(0), b, BYTE(0), BYTE(0), BYTE(0), b, b, b, b}) probe.push_back(p);
+    }
+    for (UINT r = 0; r < 256; r += 17) {
+        for (UINT g = 0; g < 256; g += 17) {
+            for (UINT b = 0; b < 256; b += 17) {
+                for (const UINT p : {b, g, r}) probe.push_back(BYTE(p));
+            }
+        }
+    }
+    const UINT n = UINT(probe.size() / 3);
+    std::vector<BYTE> out(probe.size());
+    ComPtr<IWICBitmap> row;
+    ComPtr<IWICColorContext> srgb;
+    ComPtr<IWICColorTransform> transform;
+    HRESULT hr = wic->CreateBitmapFromMemory(n, 1, GUID_WICPixelFormat24bppBGR, n * 3, n * 3, probe.data(), &row);
+    if (SUCCEEDED(hr)) hr = wic->CreateColorContext(&srgb);
+    if (SUCCEEDED(hr)) hr = srgb->InitializeFromExifColorSpace(1);
+    if (SUCCEEDED(hr)) hr = wic->CreateColorTransformer(&transform);
+    if (SUCCEEDED(hr)) hr = transform->Initialize(row.Get(), profile, srgb.Get(), GUID_WICPixelFormat24bppBGR);
+    if (SUCCEEDED(hr)) hr = transform->CopyPixels(nullptr, n * 3, n * 3, out.data());
+    const bool keeps = SUCCEEDED(hr) && out == probe;  // a CMYK or gray profile can't convert RGB at all
+
+    AcquireSRWLockExclusive(&lock);
+    known[knownCount++ % 8] = {key, keeps};
+    ReleaseSRWLockExclusive(&lock);
+    return keeps;
+}
+
+// Converts source, which shows frame, from the color space frame's colors are in to sRGB, the one Windows shows
+// a program's pixels in, unless they are in sRGB already. Returns whether it did; a profile Windows can't use
+// leaves source as it is.
+bool ToSrgb(IWICImagingFactory* wic, IWICBitmapFrameDecode* frame, ComPtr<IWICBitmapSource>& source) {
+    ComPtr<IWICColorContext> from;
+    for (const auto& context : ColorContexts(wic, frame)) {
+        UINT space = 0;
+        if (IsProfile(context.Get())) {
+            from = context;
+            break;
+        }
+        if (!from && SUCCEEDED(context->GetExifColorSpace(&space)) && space == 2) from = context;  // Adobe RGB
+    }
+    ComPtr<IWICColorContext> srgb;
+    ComPtr<IWICColorTransform> transform;
+    if (!from || (IsProfile(from.Get()) && KeepsColors(wic, from.Get())) || FAILED(wic->CreateColorContext(&srgb)) ||
+        FAILED(srgb->InitializeFromExifColorSpace(1))) {
+        return false;
+    }
+    // 24bpp unless there is alpha to keep: converting to 32bpp changes colors even from sRGB to sRGB.
+    const WICPixelFormatGUID& format =
+        CanBeTransparent(wic, source.Get()) ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat24bppBGR;
+    if (FAILED(wic->CreateColorTransformer(&transform)) ||
+        FAILED(transform->Initialize(source.Get(), from.Get(), srgb.Get(), format))) {
+        return false;
+    }
+    source = transform;
+    return true;
+}
+
+// Puts a GIF's frame 0, which can be smaller than the image and anywhere on it, where it belongs on a transparent
+// canvas, as browsers show it. A canvas too large to make shows the frame alone.
+HRESULT PlaceGifFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, IWICBitmapFrameDecode* frame,
+                      ComPtr<IWICBitmapSource>& source, UINT& width, UINT& height) {
+    UINT w = 0, h = 0;
+    HRESULT hr = GifCanvas(decoder, frame, w, h);
+    if (FAILED(hr) || (w == width && h == height) || w > kMaxBitmapSize || h > kMaxBitmapSize) return hr;
+    const POINT at = GifFrameOffset(frame);
+    ComPtr<IWICBitmap> canvas;
+    ComPtr<IWICFormatConverter> bgra;
+    ComPtr<IWICBitmapLock> lock;
+    UINT stride = 0, size = 0;
+    BYTE* data = nullptr;
+    hr = wic->CreateBitmap(w, h, GUID_WICPixelFormat32bppBGRA, WICBitmapCacheOnLoad, &canvas);
+    if (SUCCEEDED(hr)) hr = wic->CreateFormatConverter(&bgra);
+    if (SUCCEEDED(hr)) {
+        hr = bgra->Initialize(frame, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                              WICBitmapPaletteTypeCustom);
+    }
+    if (SUCCEEDED(hr)) hr = canvas->Lock(nullptr, WICBitmapLockWrite, &lock);
+    if (SUCCEEDED(hr)) hr = lock->GetStride(&stride);
+    if (SUCCEEDED(hr)) hr = lock->GetDataPointer(&size, &data);
+    if (FAILED(hr)) return hr;
+    memset(data, 0, size);
+    const size_t offset = size_t(at.y) * stride + size_t(at.x) * 4;  // the canvas fits the frame there
+    hr = bgra->CopyPixels(nullptr, stride, UINT(size - offset), data + offset);
+    if (FAILED(hr)) return hr;
+    source = canvas;
+    width = w;
+    height = h;
+    return S_OK;
+}
+
+// What OpenDecoded found out besides the pixels.
+struct Opened {
     ComPtr<IWICBitmapFrameDecode> frame;
+    SIZE full{};  // the stored size, before scaling
+    int orientation = 1;  // the EXIF orientation, if not applied
+    std::vector<ComPtr<IWICColorContext>> profiles;  // ICC profiles, if asked for
+    bool converted = false;  // colors were converted to sRGB
+};
+
+// OpenSource for a source that isn't a bitmap, once its decoder is made; the orientation is applied if rotate.
+HRESULT OpenDecoded(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT maxSize, Colors colors, bool rotate,
+                    bool wantProfiles, ComPtr<IWICBitmapSource>& source, UINT& width, UINT& height, Opened& info) {
+    ComPtr<IWICBitmapFrameDecode>& frame = info.frame;
     HRESULT hr = GetFrame(wic, decoder, frame);
     if (SUCCEEDED(hr)) hr = frame->GetSize(&width, &height);
     if (FAILED(hr)) return hr;
     if (width == 0 || height == 0) return WINCODEC_ERR_BADIMAGE;
     if (UINT64(width) * height > kMaxSourcePixels) return WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
-    if (full) *full = {LONG(width), LONG(height)};
-
+    GUID container{};
+    decoder->GetContainerFormat(&container);
     source = frame;
+    if (container == GUID_ContainerFormatGif) {
+        hr = PlaceGifFrame(wic, decoder, frame.Get(), source, width, height);
+        if (FAILED(hr)) return hr;
+    }
+    info.full = {LONG(width), LONG(height)};
+    if (wantProfiles) {
+        for (const auto& context : ColorContexts(wic, frame.Get())) {
+            if (IsProfile(context.Get())) info.profiles.push_back(context);
+        }
+    }
+
     if (maxSize && (width > maxSize || height > maxSize)) {
         // Scaling at the decoder lets codecs like JPEG decode at reduced size directly.
         const double factor = double(maxSize) / std::max(width, height);
@@ -589,10 +760,11 @@ HRESULT OpenDecoded(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT ma
         height = std::max(1u, UINT(height * factor));
         ComPtr<IWICBitmapScaler> scaler;
         hr = wic->CreateBitmapScaler(&scaler);
-        if (SUCCEEDED(hr)) hr = scaler->Initialize(frame.Get(), width, height, WICBitmapInterpolationModeFant);
+        if (SUCCEEDED(hr)) hr = scaler->Initialize(source.Get(), width, height, WICBitmapInterpolationModeFant);
         if (FAILED(hr)) return hr;
         source = scaler;
     }
+    if (colors == Colors::kSrgb) info.converted = ToSrgb(wic, frame.Get(), source);
 
     // EXIF orientation -> WIC transform (WIC flips first, then rotates clockwise).
     static constexpr WICBitmapTransformOptions kTransforms[] = {
@@ -603,11 +775,9 @@ HRESULT OpenDecoded(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT ma
         WICBitmapTransformOptions(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal),
         WICBitmapTransformRotate270,
     };
-    GUID container{};
-    decoder->GetContainerFormat(&container);
     const int exif = ReadOrientation(frame.Get(), container);
-    if (orientation) {
-        *orientation = exif;
+    if (!rotate) {
+        info.orientation = exif;
     } else if (exif != 1) {
         // The rotator reads its source pixel by pixel, so buffer it to keep strip reads below linear.
         ComPtr<IWICBitmap> buffered;
@@ -634,10 +804,11 @@ HRESULT OpenEncoded(const Source& src, ComPtr<IStream>& stream, GUID& format) {
     return hr;
 }
 
-HRESULT OpenSource(IWICImagingFactory* wic, const Source& src, UINT maxSize, ComPtr<IWICBitmapSource>& source,
-                   UINT& width, UINT& height, SIZE* full, int* orientation) {
-    if (src.bitmap) {
-        if (orientation) *orientation = 1;
+HRESULT OpenSource(IWICImagingFactory* wic, const Source& src, UINT maxSize, Colors colors,
+                   ComPtr<IWICBitmapSource>& source, UINT& width, UINT& height, SIZE* full, int* orientation,
+                   std::vector<ComPtr<IWICColorContext>>* profiles) {
+    if (orientation) *orientation = 1;
+    if (src.bitmap) {  // holds the upright pixels as shown, which have no profile
         ComPtr<IWICBitmap> bitmap;
         HRESULT hr = wic->CreateBitmapFromHBITMAP(src.bitmap, nullptr, WICBitmapIgnoreAlpha, &bitmap);
         if (SUCCEEDED(hr)) hr = bitmap->GetSize(&width, &height);
@@ -646,46 +817,17 @@ HRESULT OpenSource(IWICImagingFactory* wic, const Source& src, UINT maxSize, Com
         return hr;
     }
     ComPtr<IWICBitmapDecoder> decoder;
+    Opened info;
     HRESULT hr = OpenDecoder(wic, src, decoder);
-    if (SUCCEEDED(hr)) hr = OpenDecoded(wic, decoder.Get(), maxSize, source, width, height, full, orientation);
-    return hr;
-}
-
-namespace {
-
-// Adds the ICC profiles of a decoded frame to out.
-void FrameProfiles(IWICImagingFactory* wic, IWICBitmapFrameDecode* frame, std::vector<ComPtr<IWICColorContext>>& out) {
-    UINT count = 0;
-    if (FAILED(frame->GetColorContexts(0, nullptr, &count)) || count == 0 || count > 16) return;
-    std::vector<ComPtr<IWICColorContext>> contexts(count);
-    std::vector<IWICColorContext*> raw(count);
-    for (UINT i = 0; i < count; ++i) {
-        if (FAILED(wic->CreateColorContext(&contexts[i]))) return;
-        raw[i] = contexts[i].Get();
+    if (SUCCEEDED(hr)) {
+        hr = OpenDecoded(wic, decoder.Get(), maxSize, colors, !orientation, profiles != nullptr, source, width, height,
+                         info);
     }
-    if (FAILED(frame->GetColorContexts(count, raw.data(), &count))) return;
-    for (UINT i = 0; i < count; ++i) {
-        WICColorContextType type;
-        if (SUCCEEDED(contexts[i]->GetType(&type)) && type == WICColorContextProfile) out.push_back(contexts[i]);
-    }
-}
-
-// Whether source is a decoded frame with an ICC profile, which a bitmap of its pixels would lose.
-bool HasColorProfile(IWICImagingFactory* wic, IWICBitmapSource* source) {
-    ComPtr<IWICBitmapFrameDecode> frame;
-    std::vector<ComPtr<IWICColorContext>> profiles;
-    if (SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&frame)))) FrameProfiles(wic, frame.Get(), profiles);
-    return !profiles.empty();
-}
-
-}  // namespace
-
-void ReadColorProfiles(IWICImagingFactory* wic, const Source& src, std::vector<ComPtr<IWICColorContext>>& out) {
-    ComPtr<IWICBitmapDecoder> decoder;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    if (!src.bitmap && SUCCEEDED(OpenDecoder(wic, src, decoder)) && SUCCEEDED(GetFrame(wic, decoder.Get(), frame))) {
-        FrameProfiles(wic, frame.Get(), out);
-    }
+    if (FAILED(hr)) return hr;
+    if (full) *full = info.full;
+    if (orientation) *orientation = info.orientation;
+    if (profiles) *profiles = std::move(info.profiles);
+    return S_OK;
 }
 
 HRESULT DecodeAnimation(const Source& src, Animation& out, const std::atomic<bool>& stop) {
@@ -708,11 +850,11 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
     if (FAILED(hr)) return hr;
     ComPtr<IWICBitmapSource> source;
     UINT width = 0, height = 0;  // of the source, before orientation is applied
-    SIZE full{};  // the same, before scaling down
-    int orientation = 1;
+    Opened info;  // full is the size before scaling down
     GUID container{};
     if (src.bitmap) {
-        hr = OpenSource(wic.Get(), src, kMaxBitmapSize, source, width, height, &full, &orientation);
+        hr = OpenSource(wic.Get(), src, kMaxBitmapSize, Colors::kStored, source, width, height, &info.full,
+                        &info.orientation);
     } else {
         ComPtr<IWICBitmapDecoder> decoder;
         hr = OpenDecoder(wic.Get(), src, decoder);
@@ -722,10 +864,13 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
         }
         if (SUCCEEDED(hr)) hr = decoder->GetContainerFormat(&container);
         if (SUCCEEDED(hr)) {
-            hr = OpenDecoded(wic.Get(), decoder.Get(), kMaxBitmapSize, source, width, height, &full, &orientation);
+            hr = OpenDecoded(wic.Get(), decoder.Get(), kMaxBitmapSize, Colors::kSrgb, false, true, source, width,
+                             height, info);
         }
     }
     if (FAILED(hr)) return hr;
+    const SIZE full = info.full;
+    const int orientation = info.orientation;
     WICPixelFormatGUID format{};
     source->GetPixelFormat(&format);
     const bool transparent = CanBeTransparent(wic.Get(), source.Get());
@@ -793,9 +938,10 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
     const bool canDecodeDirect = orientation == 1 && !transparent && Is8BitColor(format);
     // A large color JPEG shown at full size decodes in bands on several cores instead of the loop below.
     const bool inBands = !countColors && !transparent && UINT(full.cx) == width && UINT(full.cy) == height &&
-                         UINT64(width) * height >= kMinBandPixels && IsInterleavedJpeg(source.Get());
+                         UINT64(width) * height >= kMinBandPixels && IsInterleavedJpeg(info.frame.Get());
     if (inBands) {
-        hr = DecodeBands({wic.Get(), &src, width, 0, 0, &place24, sideways, canDecodeDirect, bits, stride24, stop},
+        hr = DecodeBands({wic.Get(), &src, width, 0, 0, &place24, sideways, canDecodeDirect, info.converted, bits,
+                          stride24, stop},
                          height);
     }
     ComPtr<IWICFormatConverter> direct;
@@ -904,8 +1050,9 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
     out.height = outH;
     out.fullWidth = UINT(sideways ? full.cy : full.cx);
     out.fullHeight = UINT(sideways ? full.cx : full.cy);
+    // A bitmap of the pixels would lose the profile, and converted colors aren't the stored ones.
     out.exact = alpha == 255 && UINT(full.cx) == width && UINT(full.cy) == height && Is8BitColor(format) &&
-                !HasColorProfile(wic.Get(), source.Get());
+                info.profiles.empty() && !info.converted;
     return S_OK;
 }
 

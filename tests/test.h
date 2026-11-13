@@ -90,6 +90,14 @@ std::vector<BYTE> EncodeBytes(const GUID& container, IWICBitmapSource* source,
                               const WICPixelFormatGUID* format = nullptr);
 // The sRGB profile Windows ships, as a color context.
 ComPtr<IWICColorContext> SrgbProfile();
+// An ICC v2 display profile of D50-adapted primaries (columns of m: red, green, blue XYZ) and a gamma curve.
+std::vector<BYTE> MatrixProfile(const double (&m)[3][3], double gamma);
+// Display P3's primaries with a 2.2 gamma: the wide-gamut kind of profile phones embed.
+std::vector<BYTE> DisplayP3Profile();
+ComPtr<IWICColorContext> ProfileFrom(const std::vector<BYTE>& bytes);
+// What the viewer must show of a frame in profile's colors: converted by WIC to sRGB (as 24bpp, or 32bpp with
+// alpha), upright, composited over the background.
+Pixels ShownInSrgb(IWICBitmapSource* frame, IWICColorContext* profile, int orientation = 1, bool alpha = false);
 
 // Writes an image of random pixels in the given container and pixel format, with an EXIF orientation. For 24bpp,
 // the first fewColorRows rows use only fewColors colors. profile, if given, is embedded.
@@ -145,7 +153,9 @@ void TestScaling();
 void TestScalingEdges();
 void TestOrientation();
 void TestFormats();
+void TestColorManagement();
 void TestDecodeSources();
+void TestHeif();
 void TestSniffing();
 void TestDecodeLimits();
 void TestBands();

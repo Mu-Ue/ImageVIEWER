@@ -1,7 +1,9 @@
 #include "test.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <iterator>
 #include <unordered_set>
 
 #include "config.h"
@@ -337,7 +339,10 @@ HRESULT EncodeTo(IStream* stream, const GUID& container, IWICBitmapSource* sourc
         value.vt = VT_UI2;
         value.uiVal = USHORT(orientation);
         hr = frame->GetMetadataQueryWriter(&meta);
-        const wchar_t* query = container == GUID_ContainerFormatJpeg ? L"/app1/ifd/{ushort=274}" : L"/ifd/{ushort=274}";
+        // HEIF keeps it as rotation and mirror boxes, which WIC writes from this property.
+        const wchar_t* query = container == GUID_ContainerFormatJpeg   ? L"/app1/ifd/{ushort=274}"
+                               : container == GUID_ContainerFormatHeif ? L"/heifProps/Orientation"
+                                                                       : L"/ifd/{ushort=274}";
         if (SUCCEEDED(hr)) hr = meta->SetMetadataByName(query, &value);
     }
     if (SUCCEEDED(hr)) hr = frame->WriteSource(source, nullptr);
@@ -378,6 +383,95 @@ ComPtr<IWICColorContext> SrgbProfile() {
     return profile;
 }
 
+namespace {
+
+void Put32(std::vector<BYTE>& v, size_t at, UINT32 x) {
+    v[at] = BYTE(x >> 24);
+    v[at + 1] = BYTE(x >> 16);
+    v[at + 2] = BYTE(x >> 8);
+    v[at + 3] = BYTE(x);
+}
+
+UINT32 S15Fixed16(double d) {
+    return UINT32(INT32(std::lround(d * 65536.0)));
+}
+
+}  // namespace
+
+std::vector<BYTE> MatrixProfile(const double (&m)[3][3], double gamma) {
+    const auto tag = [](const char* type, size_t size) {
+        std::vector<BYTE> d(size);
+        memcpy(d.data(), type, 4);
+        return d;
+    };
+    const auto xyz = [&](double x, double y, double z) {
+        std::vector<BYTE> d = tag("XYZ ", 20);
+        Put32(d, 8, S15Fixed16(x));
+        Put32(d, 12, S15Fixed16(y));
+        Put32(d, 16, S15Fixed16(z));
+        return d;
+    };
+    std::vector<BYTE> curve = tag("curv", 14);
+    Put32(curve, 8, 1);
+    const UINT u8f8 = UINT(std::lround(gamma * 256));
+    curve[12] = BYTE(u8f8 >> 8);
+    curve[13] = BYTE(u8f8);
+    const char name[] = "Test matrix";
+    std::vector<BYTE> desc = tag("desc", 12 + sizeof(name) + 4 + 4 + 2 + 1 + 67);
+    Put32(desc, 8, sizeof(name));
+    memcpy(desc.data() + 12, name, sizeof(name));
+    std::vector<BYTE> copyright = tag("text", 8);
+    copyright.push_back(0);
+    const std::pair<const char*, std::vector<BYTE>> tags[] = {
+        {"desc", desc}, {"cprt", copyright}, {"wtpt", xyz(0.9642, 1.0, 0.8249)},
+        {"rXYZ", xyz(m[0][0], m[1][0], m[2][0])}, {"gXYZ", xyz(m[0][1], m[1][1], m[2][1])},
+        {"bXYZ", xyz(m[0][2], m[1][2], m[2][2])}, {"rTRC", curve}, {"gTRC", curve}, {"bTRC", curve}};
+    std::vector<BYTE> p(128 + 4 + std::size(tags) * 12);
+    for (size_t i = 0; i < std::size(tags); ++i) {
+        while (p.size() % 4) p.push_back(0);
+        memcpy(p.data() + 132 + i * 12, tags[i].first, 4);
+        Put32(p, 132 + i * 12 + 4, UINT32(p.size()));
+        Put32(p, 132 + i * 12 + 8, UINT32(tags[i].second.size()));
+        p.insert(p.end(), tags[i].second.begin(), tags[i].second.end());
+    }
+    Put32(p, 0, UINT32(p.size()));
+    Put32(p, 8, 0x02100000);  // version 2.1
+    memcpy(p.data() + 12, "mntrRGB XYZ ", 12);
+    memcpy(p.data() + 36, "acsp", 4);
+    Put32(p, 68, 0xF6D6);  // the D50 illuminant
+    Put32(p, 72, 0x10000);
+    Put32(p, 76, 0xD32D);
+    Put32(p, 128, UINT32(std::size(tags)));
+    return p;
+}
+
+std::vector<BYTE> DisplayP3Profile() {
+    static constexpr double kP3[3][3] = {
+        {0.515102, 0.291965, 0.157153}, {0.241182, 0.692236, 0.066582}, {-0.001050, 0.041882, 0.784378}};
+    return MatrixProfile(kP3, 2.2);
+}
+
+ComPtr<IWICColorContext> ProfileFrom(const std::vector<BYTE>& bytes) {
+    ComPtr<IWICColorContext> profile;
+    if (FAILED(Wic()->CreateColorContext(&profile)) ||
+        FAILED(profile->InitializeFromMemory(bytes.data(), UINT(bytes.size())))) {
+        return nullptr;
+    }
+    return profile;
+}
+
+Pixels ShownInSrgb(IWICBitmapSource* frame, IWICColorContext* profile, int orientation, bool alpha) {
+    ComPtr<IWICColorContext> srgb;
+    ComPtr<IWICColorTransform> transform;
+    if (FAILED(Wic()->CreateColorContext(&srgb)) || FAILED(srgb->InitializeFromExifColorSpace(1)) ||
+        FAILED(Wic()->CreateColorTransformer(&transform)) ||
+        FAILED(transform->Initialize(frame, profile, srgb.Get(),
+                                     alpha ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat24bppBGR))) {
+        return {};
+    }
+    return OverBackground(ReadSource(Upright(transform.Get(), orientation).Get(), GUID_WICPixelFormat32bppPBGRA));
+}
+
 HRESULT WriteImage(IWICImagingFactory* wic, const std::wstring& path, const GUID& container, WICPixelFormatGUID format,
                    UINT w, UINT h, int orientation, std::mt19937& rng, UINT fewColorRows, UINT fewColors,
                    IWICColorContext* profile) {
@@ -409,7 +503,10 @@ HRESULT WriteImage(IWICImagingFactory* wic, const std::wstring& path, const GUID
         value.vt = VT_UI2;
         value.uiVal = USHORT(orientation);
         hr = frame->GetMetadataQueryWriter(&meta);
-        const wchar_t* query = container == GUID_ContainerFormatJpeg ? L"/app1/ifd/{ushort=274}" : L"/ifd/{ushort=274}";
+        // HEIF keeps it as rotation and mirror boxes, which WIC writes from this property.
+        const wchar_t* query = container == GUID_ContainerFormatJpeg   ? L"/app1/ifd/{ushort=274}"
+                               : container == GUID_ContainerFormatHeif ? L"/heifProps/Orientation"
+                                                                       : L"/ifd/{ushort=274}";
         if (SUCCEEDED(hr)) hr = meta->SetMetadataByName(query, &value);
     }
     const UINT bpp = indexed || format == GUID_WICPixelFormat8bppGray ? 8 : format == GUID_WICPixelFormat32bppBGRA ? 32 : 24;
@@ -546,7 +643,10 @@ std::vector<Pixels> ComposeGif(const Gif& gif) {
     const UINT32 background = 0xFF000000 | GetRValue(kBackground) << 16 | GetGValue(kBackground) << 8 |
                               GetBValue(kBackground);
     std::vector<Pixels> shown;
-    Pixels canvas{gif.width, gif.height, std::vector<UINT32>(size_t(gif.width) * gif.height, background)};
+    // Like browsers, the canvas grows to fit frame 0 if the file claims a smaller one.
+    const UINT width = gif.frames.empty() ? gif.width : std::max(gif.width, UINT(gif.frames[0].rect.right));
+    const UINT height = gif.frames.empty() ? gif.height : std::max(gif.height, UINT(gif.frames[0].rect.bottom));
+    Pixels canvas{width, height, std::vector<UINT32>(size_t(width) * height, background)};
     for (const GifFrame& f : gif.frames) {
         const Pixels before = canvas;
         const std::vector<UINT32>& colors = f.palette.empty() ? gif.palette : f.palette;
@@ -554,14 +654,14 @@ std::vector<Pixels> ComposeGif(const Gif& gif) {
         for (LONG y = f.rect.top; y < f.rect.bottom; ++y) {
             for (LONG x = f.rect.left; x < f.rect.right; ++x) {
                 const BYTE index = f.indices[size_t(y - f.rect.top) * w + (x - f.rect.left)];
-                if (x >= LONG(gif.width) || y >= LONG(gif.height) || index == f.transparent) continue;
-                canvas.argb[size_t(y) * gif.width + x] = 0xFF000000 | (index < colors.size() ? colors[index] : 0);
+                if (x >= LONG(width) || y >= LONG(height) || index == f.transparent) continue;
+                canvas.argb[size_t(y) * width + x] = 0xFF000000 | (index < colors.size() ? colors[index] : 0);
             }
         }
         shown.push_back(canvas);
-        for (LONG y = f.rect.top; y < std::min(f.rect.bottom, LONG(gif.height)); ++y) {
-            for (LONG x = f.rect.left; x < std::min(f.rect.right, LONG(gif.width)); ++x) {
-                const size_t i = size_t(y) * gif.width + x;
+        for (LONG y = f.rect.top; y < std::min(f.rect.bottom, LONG(height)); ++y) {
+            for (LONG x = f.rect.left; x < std::min(f.rect.right, LONG(width)); ++x) {
+                const size_t i = size_t(y) * width + x;
                 if (f.disposal == 2) canvas.argb[i] = background;
                 if (f.disposal == 3) canvas.argb[i] = before.argb[i];
             }

@@ -21,7 +21,7 @@ struct Image {
     UINT width = 0;
     UINT height = 0;
     UINT fullWidth = 0, fullHeight = 0;  // upright size of the source, which is larger if it was scaled down
-    bool exact = false;  // the bitmap holds every source pixel unchanged, so it can stand in for the source
+    bool exact = false;  // the bitmap holds every source pixel and color unchanged, so it can stand in for the source
 };
 
 // The WIC factory, made straight from windowscodecs.dll: CoCreateInstance would first look the class up
@@ -43,12 +43,18 @@ private:
     Microsoft::WRL::ComPtr<IWICImagingFactory> factory_;
 };
 
+// How OpenSource reads colors: as stored, which Save As keeps along with the image's color profiles, or
+// converted to sRGB from the image's profile, as they are shown and copied.
+enum class Colors { kStored, kSrgb };
+
 // Opens the upright image: the chosen frame, scaled to fit maxSize (0 = no limit), EXIF orientation applied.
 // full, if given, is set to the stored size before scaling. If orientation is given, it is set to the
 // EXIF orientation (1-8) instead of applying it, and width and height are those of the stored pixels.
-HRESULT OpenSource(IWICImagingFactory* wic, const Source& src, UINT maxSize,
+// profiles, if given, gets the image's ICC profiles.
+HRESULT OpenSource(IWICImagingFactory* wic, const Source& src, UINT maxSize, Colors colors,
                    Microsoft::WRL::ComPtr<IWICBitmapSource>& source, UINT& width, UINT& height,
-                   SIZE* full = nullptr, int* orientation = nullptr);
+                   SIZE* full = nullptr, int* orientation = nullptr,
+                   std::vector<Microsoft::WRL::ComPtr<IWICColorContext>>* profiles = nullptr);
 
 // Opens the encoded data of a file or pasted source, rewound, and sets format to its container. Fails for a
 // source that is only a decoded bitmap, or data in a format this viewer doesn't open.
@@ -58,13 +64,9 @@ HRESULT OpenEncoded(const Source& src, Microsoft::WRL::ComPtr<IStream>& stream, 
 // palettized, so does its palette.
 bool CanBeTransparent(IWICImagingFactory* wic, IWICBitmapSource* source);
 
-// Adds the ICC profiles of src's image to out, if it has any.
-void ReadColorProfiles(IWICImagingFactory* wic, const Source& src,
-                       std::vector<Microsoft::WRL::ComPtr<IWICColorContext>>& out);
-
 struct Animation;
 
-// Decodes into the smallest exact DIB section. Needs COM initialized on the calling thread. If animated is
+// Decodes into the smallest exact DIB section, colors converted to sRGB as OpenSource does for Colors::kSrgb. Needs COM initialized on the calling thread. If animated is
 // given, it is set to whether the image is an animated GIF, and out is then its canvas showing the first
 // frame, for DecodeAnimation to play. Gives up with E_ABORT once stop, if given, is set.
 HRESULT DecodeImage(const Source& src, Image& out, bool* animated = nullptr, const std::atomic<bool>* stop = nullptr);

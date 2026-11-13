@@ -43,6 +43,7 @@ add_executable(tests EXCLUDE_FROM_ALL
     tests/support.cpp
     tests/scale_tests.cpp
     tests/decoder_tests.cpp
+    tests/color_tests.cpp
     tests/animation_tests.cpp
     tests/encoder_tests.cpp
     tests/clipboard_tests.cpp

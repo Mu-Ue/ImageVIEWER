@@ -287,9 +287,12 @@ HRESULT EncodeDib(IWICImagingFactory* wic, IWICBitmapSource* source, HGLOBAL& ou
     memcpy(p, &info, sizeof(info));
     // Rows are read top-down, the order decoders produce them in, and stored bottom-up.
     BYTE* const pixels = p + sizeof(info);
+    const size_t used = size_t(width) * 3;
     for (UINT y = 0; y < height && SUCCEEDED(hr); ++y) {
         const WICRect row{0, INT(y), INT(width), 1};
-        hr = converter->CopyPixels(&row, UINT(stride), UINT(stride), pixels + (height - 1 - y) * stride);
+        BYTE* const d = pixels + (height - 1 - y) * stride;
+        hr = converter->CopyPixels(&row, UINT(stride), UINT(stride), d);
+        memset(d + used, 0, size_t(stride) - used);  // else the row padding leaks this process's memory
     }
     GlobalUnlock(dib);
     if (FAILED(hr)) {
@@ -336,8 +339,9 @@ HRESULT SaveImage(const Source& src, const std::wstring& path) {
             ComPtr<IWICBitmapSource> source;
             UINT width = 0, height = 0;
             std::vector<ComPtr<IWICColorContext>> profiles;
-            if (SUCCEEDED(hr)) hr = OpenSource(wic.Get(), src, 0, source, width, height);
-            if (SUCCEEDED(hr)) ReadColorProfiles(wic.Get(), src, profiles);
+            if (SUCCEEDED(hr)) {
+                hr = OpenSource(wic.Get(), src, 0, Colors::kStored, source, width, height, nullptr, nullptr, &profiles);
+            }
             if (SUCCEEDED(hr)) hr = Encode(wic.Get(), source.Get(), stream.Get(), ContainerFor(path), profiles);
         }
     }  // releases the source file, which may be the one replaced
@@ -357,7 +361,8 @@ HRESULT EncodeClipboardImage(const Source& src, HGLOBAL& png, HGLOBAL& dib) {
     HRESULT hr = wic.hr;
     ComPtr<IWICBitmapSource> source;
     UINT width = 0, height = 0;
-    if (SUCCEEDED(hr)) hr = OpenSource(wic.Get(), src, 0, source, width, height);
+    // Other programs read the clipboard's pixels as sRGB, so they get the colors as shown.
+    if (SUCCEEDED(hr)) hr = OpenSource(wic.Get(), src, 0, Colors::kSrgb, source, width, height);
     if (SUCCEEDED(hr)) hr = Buffer(wic.Get(), source);  // read for the PNG and for the DIB
     ComPtr<IStream> stream;
     HGLOBAL encoded = nullptr;

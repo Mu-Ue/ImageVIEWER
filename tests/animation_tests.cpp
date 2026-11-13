@@ -4,6 +4,7 @@
 #include "config.h"
 #include "imaging/animation.h"
 #include "imaging/decoder.h"
+#include "imaging/encoder.h"
 #include "test.h"
 
 // Each frame is drawn over the last, after undoing it as its disposal asks: 2 clears to the background, 3
@@ -242,6 +243,73 @@ void TestGifFiles() {
             Fail("still GIF with transparency shown wrong", 0);
         }
         if (image.bitmap) DeleteObject(image.bitmap);
+    }
+
+    // A still GIF whose frame covers only part of the image shows on the whole canvas, like browsers, and is
+    // copied and saved that way, with the rest transparent.
+    {
+        Gif gif{200, 120, global, -1};
+        gif.frames = {RandomGifFrame(rng, {50, 30, 150, 100}, 256)};
+        const std::vector<BYTE> data = WriteGif(gif);
+        const std::wstring path = TempPath(L"offset still.gif");
+        WriteAll(path, data);
+        Image image;
+        if (FAILED(DecodeImage(Source{path}, image))) {
+            Fail("offset still GIF didn't decode", 0);
+        } else {
+            if (image.width != 200 || image.height != 120 || image.fullWidth != 200 || image.fullHeight != 120) {
+                Fail("offset still GIF shown at its frame's size", int(image.width));
+            }
+            if (DibPixels(image.bitmap) != ComposeGif(gif)[0]) Fail("offset still GIF shown wrong", 0);
+            if (image.exact) Fail("offset still GIF counts as exact", 0);
+            DeleteObject(image.bitmap);
+        }
+        HGLOBAL png = nullptr, dib = nullptr;
+        if (FAILED(EncodeClipboardImage(Source{path}, png, dib))) {
+            Fail("offset still GIF didn't copy", 0);
+        } else {
+            const BYTE* p = static_cast<const BYTE*>(GlobalLock(png));
+            const Pixels copied =
+                ReadSource(WicFrame(std::vector<BYTE>(p, p + GlobalSize(png))).Get(), GUID_WICPixelFormat32bppPBGRA);
+            GlobalUnlock(png);
+            GlobalFree(png);
+            GlobalFree(dib);
+            if (copied.width != 200 || copied.height != 120 || copied.at(10, 10) >> 24 != 0 ||
+                copied.at(60, 40) >> 24 != 255 || OverBackground(copied) != ComposeGif(gif)[0]) {
+                Fail("offset still GIF copied wrong", int(copied.width));
+            }
+        }
+        const std::wstring saved = TempPath(L"offset still.png");
+        if (FAILED(SaveImage(Source{path}, saved)) ||
+            OverBackground(ReadSource(WicFrame(saved).Get(), GUID_WICPixelFormat32bppPBGRA)) != ComposeGif(gif)[0]) {
+            Fail("offset still GIF saved wrong", 0);
+        }
+        DeleteFileW(saved.c_str());
+        DeleteFileW(path.c_str());
+    }
+
+    // A first frame larger than the image the file claims grows the canvas to fit, like browsers: still or animated.
+    for (const UINT frames : {1u, 2u}) {
+        Gif gif{10, 8, global, 0};
+        gif.frames = {RandomGifFrame(rng, {4, 2, 30, 20}, 256), RandomGifFrame(rng, {0, 0, 40, 40}, 256)};
+        gif.frames.resize(frames);
+        const std::vector<BYTE> data = WriteGif(gif);
+        Image image;
+        bool animated = false;
+        if (FAILED(DecodeImage(Source{.stream = MemoryStream(data)}, image, &animated)) || animated != (frames > 1)) {
+            Fail("GIF larger than it claims didn't decode", int(frames));
+            continue;
+        }
+        if (image.width != 30 || image.height != 20 || DibPixels(image.bitmap) != ComposeGif(gif)[0]) {
+            Fail("GIF larger than it claims shown wrong", int(frames * 1000 + image.width));
+        }
+        DeleteObject(image.bitmap);
+        Animation a;
+        if (frames > 1 && (FAILED(ReadGif(data, a)) || a.width != 30 || a.height != 20)) {
+            Fail("animation larger than it claims read wrong", int(a.width));
+        } else if (frames > 1) {
+            CheckPlayback(a, gif, 200);
+        }
     }
 
     // Other formats are never read as animations.

@@ -51,6 +51,24 @@ LONG Height(const RECT& r) { return r.bottom - r.top; }
 
 }  // namespace
 
+POINT GifFrameOffset(IWICBitmapFrameDecode* frame) {
+    ComPtr<IWICMetadataQueryReader> meta;
+    if (FAILED(frame->GetMetadataQueryReader(&meta))) return {};
+    return {LONG(ReadUint(meta.Get(), L"/imgdesc/Left", 0)), LONG(ReadUint(meta.Get(), L"/imgdesc/Top", 0))};
+}
+
+HRESULT GifCanvas(IWICBitmapDecoder* decoder, IWICBitmapFrameDecode* first, UINT& width, UINT& height) {
+    ComPtr<IWICMetadataQueryReader> reader;
+    UINT w = 0, h = 0;
+    HRESULT hr = decoder->GetMetadataQueryReader(&reader);
+    if (SUCCEEDED(hr)) hr = first->GetSize(&w, &h);
+    if (FAILED(hr)) return hr;
+    const POINT at = GifFrameOffset(first);
+    width = std::max(ReadUint(reader.Get(), L"/logscrdesc/Width", 0), UINT(at.x) + w);
+    height = std::max(ReadUint(reader.Get(), L"/logscrdesc/Height", 0), UINT(at.y) + h);
+    return S_OK;
+}
+
 HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Animation& out, bool firstOnly,
                       const std::atomic<bool>* stop) {
     // Counted by asking for frames in turn: WIC indexes a GIF only as far as asked, so a file of millions of
@@ -67,10 +85,13 @@ HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Anima
     if (count < 2) return WINCODEC_ERR_UNSUPPORTEDOPERATION;
     if (firstOnly) count = 1;
     ComPtr<IWICMetadataQueryReader> reader;
+    ComPtr<IWICBitmapFrameDecode> first;
+    UINT width = 0, height = 0;
     HRESULT hr = decoder->GetMetadataQueryReader(&reader);
+    if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, &first);
+    if (SUCCEEDED(hr)) hr = GifCanvas(decoder, first.Get(), width, height);
     if (FAILED(hr)) return hr;
-    const UINT width = ReadUint(reader.Get(), L"/logscrdesc/Width", 0);
-    const UINT height = ReadUint(reader.Get(), L"/logscrdesc/Height", 0);
+    first.Reset();
     if (width == 0 || height == 0 || width > kMaxBitmapSize || height > kMaxBitmapSize) {
         return WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
     }
@@ -114,7 +135,7 @@ HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Anima
             budget += sizeof(GifPalette);
         }
 
-        // Frame positions and sizes are 16-bit, so these sums cannot overflow.
+        // Frame positions and sizes are 16-bit, so these sums cannot overflow. Frame 0 always fits the canvas.
         const UINT left = ReadUint(meta.Get(), L"/imgdesc/Left", 0), top = ReadUint(meta.Get(), L"/imgdesc/Top", 0);
         f.rect = {LONG(std::min(left, width)), LONG(std::min(top, height)), LONG(std::min(left + w, width)),
                   LONG(std::min(top + h, height))};
