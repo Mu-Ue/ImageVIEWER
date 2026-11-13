@@ -205,7 +205,7 @@ Only the intended changes below differ. `tests.exe` passes in both the normal an
   - Each format's compression bounds the pixels its bytes can hold: LZW about 2,730 px per byte, deflate 1032:1, JPEG about 512 px per byte.
   - Files claiming more are refused; the limits are 1.5–2× above those bounds (`MaxPixels`, `GifPixelLimit`).
   - Solid-color 4000×4000 images, and files cut in half, still open.
-  - BMP and TIFF already refused such files. JPEG XR, HEIF and WebP weren't probed this way.
+  - BMP and TIFF had the same hole; it was found and closed in the final pass below. ICO and JPEG XR refuse patched size claims themselves. HEIF and WebP weren't probed this way.
 - A save killed midway leaves no temp file: delete-on-close is set until the rename. Tested by a child process that dies mid-copy.
 - A thread that can't be made no longer ends the process through `std::terminate`. A failed DIB no longer leaves a PNG-only clipboard.
 - **AddressSanitizer build** (`-DIMAGEVIEWER_ASAN=ON`): the full suite passes. **libFuzzer** (`-DIMAGEVIEWER_FUZZ=ON`, `fuzz/fuzz.cpp`) has two targets, decode and paste. About 30 minutes of fuzzing found no memory errors, only the slow inputs above, which are now regression tests.
@@ -244,6 +244,47 @@ Memory and DLL counts are unchanged; the exe is 372,224 bytes. P3 images cost ex
 - No WebP or AVIF encoder is available, so those weren't fuzzed or probed for size claims.
 - clang-cl isn't installed. Network shares and other CPUs weren't tested.
 - A single-strip compressed TIFF, which WIC never writes, would make every band decode from the top: no slower, but wasted CPU.
+
+## Final pass (committed)
+
+Three commits: `0560899` startup without COM, `aa2ead7` lighter leak test, `a94354e` TIFF and BMP size claims. The pixel-diff harness shows all 49 images identical to the commit before.
+
+**Startup without COM.** Starting COM cost 1.2 ms on the startup critical path: on the decode thread, between "thread running" and "COM ready".
+- WIC's own codecs never need COM: decoding the whole corpus without it, HEIC and P3 included, gives identical hashes.
+- Media Foundation starts COM itself for the Store codecs, whose DLLs stay loaded either way.
+- So the startup decode and the band threads now run without it. They start it and retry only if a codec returns `CO_E_NOTINITIALIZED`.
+
+| Launch to idle, median of 21, alternated in one run | Before | After |
+|---|---|---|
+| PNG 1500×1000 | 12.46 ms, 19 modules | 10.80 ms, 17 modules |
+| JPEG 12 MP | 20.07 ms | 18.62 ms |
+| HEIC, WebP | 57 ms | 57 ms (Media Foundation dominates) |
+
+**Size claims, found by a final 4-minute fuzz run (1 worker):**
+- A 1.8 KB LZW TIFF claiming 214 MP took 1.7 s to decode.
+- A 1 KB RLE BMP claiming 400 MP took 1.2 s, and WIC held **1.8 GB** for it.
+
+The fixes in `MaxPixels`:
+- TIFF gets LZW's bound: at most 4096 bytes from each code of 9 bits or more. Fax-coded TIFFs (CCITT 2–4) are exempt: a blank row costs one bit, so a blank 600 dpi A4 page is 1 KB for 35 MP. A fax claim costs at most about 0.2 s per 256 MP at 1bpp, within the general limit.
+- BMP gets 1024 px a byte: a 255-pixel run takes 2 bytes.
+
+Tests cover both claims and the blank fax page, and each fails with its limit removed. Normal TIFF and BMP opens are unchanged, measured best of 9 three times.
+
+**Leak test:** large images are saved in one format, not three, and the small ones still cover every format. 1.9 s → 0.9 s. An injected leaked band-thread handle still fails it.
+
+**Checked, no change needed:**
+- Release links with `/INCREMENTAL:NO` and `/LTCG`. `/OPT:REF,ICF` is the default without `/DEBUG`.
+- H9: a full 2560×1440 repaint on 4 cores (affinity 0xF) is at most 11.1 ms, at 0.71 zoom of a 12 MP JPEG. That's under a 60 Hz frame; on all cores it's 4.6 ms.
+- The final fuzz run, 4 minutes of decode and 2 of paste on 1 worker each, found nothing besides the TIFF.
+
+**Measured and dropped:**
+
+| Idea | Result |
+|---|---|
+| `SetWindowPos(SWP_SHOWWINDOW)` instead of placing, then `ShowWindow` | 10.85 vs 10.71 ms: no gain |
+| Creating the window at the image's size | the window is made while the image decodes, so its size isn't known yet. Waiting would serialize the two |
+| Drawing the bars in the main window | the bars are made in parallel with the decode, which takes longer, so they're off the critical path. It would risk what screen readers announce |
+| Shortening the `app` test group (10.8 s) | it is almost entirely the decoder's 10 s idle timeout, spent sleeping with no CPU. Overlapping the other app checks would save under 1 s |
 
 ## 1. Critical: bugs, undefined behavior, security
 
@@ -387,3 +428,4 @@ Still open:
 5. ~~**D1** color management~~: done (overhaul pass).
 6. ~~H10 PNG filter for Copy~~: measured, the default is already fastest.
 7. The remaining medium items, as the code around them is touched.
+8. ~~Startup COM, TIFF/BMP size claims, H9 on 4 cores~~: done or checked (final pass).
