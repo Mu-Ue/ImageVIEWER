@@ -286,6 +286,50 @@ Tests cover both claims and the blank fax page, and each fails with its limit re
 | Drawing the bars in the main window | the bars are made in parallel with the decode, which takes longer, so they're off the critical path. It would risk what screen readers announce |
 | Shortening the `app` test group (10.8 s) | it is almost entirely the decoder's 10 s idle timeout, spent sleeping with no CPU. Overlapping the other app checks would save under 1 s |
 
+## Startup round 2 (committed)
+
+**Rotated JPEGs (`03af75a`).** Per-band timing of a 12 MP portrait JPEG showed placing a rotated band's rows costs as much as decoding them: the top band spent 8 ms copying beside 5.4 ms decoding. That cost is the same in every band, so the 0.57 split left the top band finishing last at 13.5 ms while the bottom one was done at 6 ms.
+
+Rotated bands now use the even split that converted JPEGs already use: 8 bands, 0.9. A sweep of {0.57, 0.7, 0.8, 0.9, 1.0} × {4, 8} bands picked it.
+
+| 12 MP JPEG, best of 9, three processes | Before | After |
+|---|---|---|
+| Decode, 180° (EXIF 3) | 10.9 ms | 6.8 ms |
+| Decode, 90° (EXIF 6, portrait) | 13.5 ms | 8.3 ms |
+| Decode on 4 cores, 4 bands: 180° / 90° | 13.0 / 15.1 ms | 10.4 / 12.3 ms |
+| Launch to painted, portrait / 180° (median of 21) | 26.7 / 25.0 ms | 21.7 / 20.2 ms |
+
+Pixels are identical across all 49 images. Upright, gray and P3 decodes are unchanged.
+
+A faster copy was also tried: 4-byte stores, and `memcpy` for flipped rows. It changed nothing (6.77 vs 6.53 ms, 7.79 vs 7.99 ms): the sideways copy is bound by memory bandwidth, not by instructions.
+
+**The loader floor.** All of these were measured on a hidden desktop as time from process creation to `wWinMain`, with exes built using the viewer's exact flags and manifest:
+
+| Exe | Reaches `wWinMain` |
+|---|---|
+| Imports only `kernel32` | 1.9 ms |
+| Imports `user32`, `gdi32` or `imm32`, any one alone | about 3.4 ms (the GUI connection) |
+| Also `dwmapi` | about 0.3 ms more |
+| COM (`api-ms-win-core-com`) | nothing on top |
+| The viewer's full import list | 3.8 ms |
+| The viewer itself, exiting on entry | 3.84 ms |
+
+So nothing of ours runs before `wWinMain`. Its 1.9 ms over the floor is the GUI DLLs that every window needs.
+
+WIC delay-loads its own GUI and COM dependencies, so moving the GUI imports off the decode's critical path was tested in two ways:
+- **Delay-loading `user32`, `gdi32`, `imm32`, `dwmapi` and COM, starting the decode thread first:** 0.3–0.6 ms slower. Windows already maps static imports in parallel at process start; loaded later, they queue behind the decode thread's WIC load on the loader lock, and every first call goes through the delay-load helper.
+- **Delay-loading `dwmapi` alone:** within noise (10.85/10.74 vs 11.29/10.73 ms).
+
+Both are dropped. They agree with the earlier delay-load results above.
+
+**What's left is Windows.** For a PNG launch:
+- 1.9 ms is process creation;
+- 1.9 ms is the GUI DLLs;
+- about 3.3 ms is WIC decoding;
+- about 2.5 ms is `ShowWindow` and DWM.
+
+What remains is our code, outside that critical path.
+
 ## 1. Critical: bugs, undefined behavior, security
 
 No undefined behavior or security hole survived verification. The one security candidate was disproved; it is listed at the end of this section so it isn't chased again.
