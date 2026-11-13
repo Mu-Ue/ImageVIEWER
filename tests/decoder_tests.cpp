@@ -616,6 +616,56 @@ void TestBands() {
         DeleteFileW(path.c_str());
     }
 
+    // TIFFs, whose bands each read only their own strips, in every compression WIC writes and placement.
+    int id = 100;
+    for (const BYTE compression : {BYTE(WICTiffCompressionNone), BYTE(WICTiffCompressionLZW), BYTE(WICTiffCompressionZIP)}) {
+        for (const int orientation : {1, 3, 6}) {
+            const std::wstring path = TempPath(L"band" + std::to_wstring(++id) + L".tif");
+            ComPtr<IWICStream> stream;
+            ComPtr<IWICBitmapEncoder> encoder;
+            ComPtr<IWICBitmapFrameEncode> frame;
+            ComPtr<IPropertyBag2> options;
+            ComPtr<IWICMetadataQueryWriter> meta;
+            const ComPtr<IWICBitmap> source = RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 1301, 1007);
+            WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+            PROPBAG2 name{};
+            name.pstrName = const_cast<LPOLESTR>(L"TiffCompressionMethod");
+            VARIANT value{};
+            value.vt = VT_UI1;
+            value.bVal = compression;
+            PROPVARIANT turn;
+            PropVariantInit(&turn);
+            turn.vt = VT_UI2;
+            turn.uiVal = USHORT(orientation);
+            HRESULT hr = Wic()->CreateStream(&stream);
+            if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+            if (SUCCEEDED(hr)) hr = Wic()->CreateEncoder(GUID_ContainerFormatTiff, nullptr, &encoder);
+            if (SUCCEEDED(hr)) hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+            if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(&frame, &options);
+            if (SUCCEEDED(hr)) hr = options->Write(1, &name, &value);
+            if (SUCCEEDED(hr)) hr = frame->Initialize(options.Get());
+            if (SUCCEEDED(hr)) hr = frame->SetSize(1301, 1007);
+            if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
+            if (SUCCEEDED(hr)) hr = frame->GetMetadataQueryWriter(&meta);
+            if (SUCCEEDED(hr)) hr = meta->SetMetadataByName(L"/ifd/{ushort=274}", &turn);
+            if (SUCCEEDED(hr)) hr = frame->WriteSource(source.Get(), nullptr);
+            if (SUCCEEDED(hr)) hr = frame->Commit();
+            if (SUCCEEDED(hr)) hr = encoder->Commit();
+            meta.Reset();
+            frame.Reset();
+            encoder.Reset();
+            stream.Reset();
+            if (FAILED(hr)) {
+                Fail("can't write a TIFF band test image", id);
+                continue;
+            }
+            const Want want = WantFor(path, orientation);
+            DeleteObject(CheckDecode(Source{path}, want, id).bitmap);
+            DeleteObject(CheckDecode(Source{.stream = MemoryStream(ReadAll(path))}, want, id).bitmap);
+            DeleteFileW(path.c_str());
+        }
+    }
+
     // Stopped partway through, banded decodes end cleanly, whenever the stop comes.
     const ComPtr<IWICBitmap> big = RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 4000, 3000);
     const std::wstring path = TempPath(L"band stop.jpg");

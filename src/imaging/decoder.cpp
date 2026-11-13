@@ -461,8 +461,9 @@ bool ToSrgb(IWICImagingFactory* wic, IWICBitmapFrameDecode* frame, ComPtr<IWICBi
 
 constexpr UINT64 kMinBandPixels = 1 << 20;  // smaller JPEGs decode sooner than extra threads start
 constexpr UINT kMaxBands = 4;  // later bands spend most of their time reading past the rows above
-// Converting colors costs every band the same for its own rows, so more bands pay: measured best on 16 cores.
-constexpr UINT kMaxConvertingBands = 8;
+// Converting colors, or reading TIFF strips, costs every band the same for its own rows, so more bands pay:
+// measured best on 16 cores.
+constexpr UINT kMaxEvenBands = 8;
 
 // Whether a JPEG frame's scans each hold every component, so a decoder can produce a band of rows after reading
 // past the data above it. A progressive JPEG has to be decoded whole for any band.
@@ -481,6 +482,7 @@ struct Band {
     UINT width, y0, y1;
     const Placement* place;
     bool sideways, direct, toSrgb;
+    bool strips;  // TIFF: a band reads only its own strips
     BYTE* bits;
     UINT stride24;
     const std::atomic<bool>* stop;
@@ -521,17 +523,18 @@ HRESULT DecodeBand(const Band& b) {
     return hr;
 }
 
-// Decodes a large JPEG in bands on several cores, this thread taking the first. Each band reads past the data of
-// the rows above it, at a bit under half the cost of decoding them, so each band is about 0.57 times as tall as
-// the one above for all to finish together; 0.9 when converting colors, which costs the same in every band.
+// Decodes a large JPEG or TIFF in bands on several cores, this thread taking the first. Each band of a JPEG reads
+// past the data of the rows above it, at a bit under half the cost of decoding them, so each band is about 0.57
+// times as tall as the one above for all to finish together; 0.9 when converting colors, which costs the same in
+// every band. A TIFF band reads only its own strips, so those are all as tall.
 HRESULT DecodeBands(Band base, UINT height) {
     const UINT count = std::clamp(UINT(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 1u,
-                                  base.toSrgb ? kMaxConvertingBands : kMaxBands);
-    const double shrink = base.toSrgb ? 0.9 : 0.57;
-    double weights[kMaxConvertingBands], total = 0;
+                                  base.toSrgb || base.strips ? kMaxEvenBands : kMaxBands);
+    const double shrink = base.strips ? 1.0 : base.toSrgb ? 0.9 : 0.57;
+    double weights[kMaxEvenBands], total = 0;
     for (UINT k = 0; k < count; ++k) total += weights[k] = k ? weights[k - 1] * shrink : 1.0;
-    Band bands[kMaxConvertingBands];
-    HANDLE threads[kMaxConvertingBands] = {};
+    Band bands[kMaxEvenBands];
+    HANDLE threads[kMaxEvenBands] = {};
     double above = 0;
     for (UINT k = 0; k < count; ++k) {
         bands[k] = base;
@@ -901,8 +904,10 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
     WICPixelFormatGUID format{};
     source->GetPixelFormat(&format);
     const bool transparent = CanBeTransparent(wic.Get(), source.Get());
-    // A color JPEG all but never has 256 colors or fewer, so it goes straight to 24bpp without counting them.
-    const bool countColors = container != GUID_ContainerFormatJpeg || format != GUID_WICPixelFormat24bppBGR;
+    // A color JPEG all but never has 256 colors or fewer, nor does a 24bpp TIFF, which is scanned or photographed
+    // (drawings come as palette or 1-bit TIFFs), so they go straight to 24bpp without counting them.
+    const bool tiff = container == GUID_ContainerFormatTiff;
+    const bool countColors = !((container == GUID_ContainerFormatJpeg || tiff) && format == GUID_WICPixelFormat24bppBGR);
     const UINT bg = kBackground & 0xFF;  // gray: all channels equal
     // Composites transparent 32bpp pixels over the background once, so painting is a plain blit, and ANDs their
     // alpha into alpha.
@@ -963,11 +968,11 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
 
     // Once 24bpp, upright opaque 8-bit sources are decoded straight into the bitmap: same bytes, no copy.
     const bool canDecodeDirect = orientation == 1 && !transparent && Is8BitColor(format);
-    // A large color JPEG shown at full size decodes in bands on several cores instead of the loop below.
+    // A large color JPEG or TIFF shown at full size decodes in bands on several cores instead of the loop below.
     const bool inBands = !countColors && !transparent && UINT(full.cx) == width && UINT(full.cy) == height &&
-                         UINT64(width) * height >= kMinBandPixels && IsInterleavedJpeg(info.frame.Get());
+                         UINT64(width) * height >= kMinBandPixels && (tiff || IsInterleavedJpeg(info.frame.Get()));
     if (inBands) {
-        hr = DecodeBands({wic.Get(), &src, width, 0, 0, &place24, sideways, canDecodeDirect, info.converted, bits,
+        hr = DecodeBands({wic.Get(), &src, width, 0, 0, &place24, sideways, canDecodeDirect, info.converted, tiff, bits,
                           stride24, stop},
                          height);
     }
