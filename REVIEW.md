@@ -178,6 +178,73 @@ Showing the window before the image is decoded would hide 1–15 ms more, but it
 
 **What's left at startup:** before a decode starts, 0.5 ms of thread start, 0.6–0.7 ms of `CoInitializeEx` and 0.5 ms to load WIC and make its factory; then WIC's own decode, about 0.85 ms of `ShowWindow`, and the first paint.
 
+## Overhaul pass (committed)
+
+Four commits after the I/O pass: `26cab72` colors and GIFs, `806d198` hardening, `390b978` TIFF bands. Every change was checked with a pixel-diff harness against the commit before it, over 50 images:
+- JPEG, PNG, GIF, BMP, TIFF, JPEG XR and ICO in every pixel layout and orientation,
+- P3- and sRGB-tagged images,
+- HEIC,
+- Windows wallpapers.
+
+Only the intended changes below differ. `tests.exe` passes in both the normal and the AddressSanitizer build.
+
+**Correctness (C1, D1, H2 settled):**
+
+| Change | Where |
+|---|---|
+| Images tagged with a non-sRGB profile (P3, Adobe RGB, CMYK) are shown and copied converted to sRGB by WIC's color transform. Save As keeps the stored colors and the profile. A probe of 5,120 colors shows whether a profile converts sRGB to itself, so those images stay exact; the standard 3,144-byte sRGB profile is recognized by hash, without loading the color engine. A 32bpp transform shifts even sRGB by up to 3 levels, so it is used only for alpha. 64bpp output is 5× slower for 0.1 level of mean accuracy, so it isn't used. | `decoder.cpp` `ToSrgb`, `KeepsColors` |
+| Converted JPEGs decode in 8 even bands. 12 MP P3: 18.1 → 8.5 ms | `DecodeBands` |
+| A GIF's frame 0 is placed on its logical screen (C1). The screen grows to fit frame 0, as Chromium does, in both the still and the animation path | `PlaceGifFrame`, `GifCanvas` |
+| HEIF skips the EXIF orientation query. Its decoder already applies `irot`/`imir`, and MIAF puts them above EXIF (H2) | `ReadOrientation` |
+| The clipboard DIB's row padding was uninitialized heap memory | `encoder.cpp` `EncodeDib` |
+| A rotated or scaled image with a profile counted as exact, so Save As from the bitmap dropped the profile | `Opened::profiles` |
+| Save As opened the source twice to read its profiles | `OpenSource` |
+
+**Security and robustness:**
+- **Found by fuzzing:** GIF, PNG and JPEG files of 76 B–12 KB claiming 400–900 MP. WIC filled in the missing data for 1–3 s and up to 805 MB.
+  - Each format's compression bounds the pixels its bytes can hold: LZW about 2,730 px per byte, deflate 1032:1, JPEG about 512 px per byte.
+  - Files claiming more are refused; the limits are 1.5–2× above those bounds (`MaxPixels`, `GifPixelLimit`).
+  - Solid-color 4000×4000 images, and files cut in half, still open.
+  - BMP and TIFF already refused such files. JPEG XR, HEIF and WebP weren't probed this way.
+- A save killed midway leaves no temp file: delete-on-close is set until the rename. Tested by a child process that dies mid-copy.
+- A thread that can't be made no longer ends the process through `std::terminate`. A failed DIB no longer leaves a PNG-only clipboard.
+- **AddressSanitizer build** (`-DIMAGEVIEWER_ASAN=ON`): the full suite passes. **libFuzzer** (`-DIMAGEVIEWER_FUZZ=ON`, `fuzz/fuzz.cpp`) has two targets, decode and paste. About 30 minutes of fuzzing found no memory errors, only the slow inputs above, which are now regression tests.
+- **`/analyze`:** 12 warnings, all false positives or harmless. Details:
+  - `CreatePopupMenu` failure only fails the menu.
+  - Stack use is 24 KB and 64 KB, on 1 MB threads.
+- **Binary:** ASLR with high entropy, NX, CFG, EH continuation, CET, and System32-only imports. No PDB path or user name is embedded.
+
+**Performance (decode, best of 5; launch = process start to painted, median of 15):**
+
+| | Before (`2de6493`) | Now |
+|---|---|---|
+| TIFF 6 MP uncompressed / LZW / ZIP (8 even bands) | 47 / 24 / 15.6 ms | 8.6 / 5.5 / 3.0 ms |
+| Launch: PNG 1500×1000 | 14.0 ms | 12.1 ms |
+| Launch: JPEG 12 MP, EXIF 6 | 32.8 ms | 29.6 ms |
+| Launch: TIFF 6 MP | 69.6 ms | 25.0 ms |
+| Launch: no image | 8.6 ms | 8.9 ms (within noise) |
+| Launch: Windows wallpaper | 27.9 ms | 27.6 ms |
+
+Memory and DLL counts are unchanged; the exe is 372,224 bytes. P3 images cost extra because they are converted: 1080p +2 ms, 12 MP +2 ms banded, a 1500×1000 PNG +4.3 ms, a 1080p HEIC +7.5 ms.
+
+**Measured and dropped:**
+
+| Idea | Result |
+|---|---|
+| HEIF in bands | slower: 116 → 164 ms (4 bands), 256 ms (8). The codec's decoders contend |
+| Faster `CopyPlaced` (memcpy rows, 4-byte stores) for flipped and sideways copies | within noise: the copy isn't the bottleneck |
+| PGO | within noise for decode and scaling. Most time is in WIC |
+| `/arch:AVX2` | scaler strips 5–8% faster, full draws noise. It would need runtime dispatch; under the 10% bar |
+| Direct2D/Direct3D renderer | creating the device costs 43–65 ms, about 29 MB and 40 modules, against an 8–14 ms launch |
+| Parallel color transform for non-banded sources (PNG, HEIC) | not built: it would save at most the transform (about 4 ms at 1080p), at a full-image intermediate buffer |
+| 4 TIFF bands instead of 8 | 15.1 vs 9.9 ms |
+
+**Not verified:**
+- No real iPhone HEIC was available, only WIC-encoded ones, so grid HEICs and the EXIF-plus-`irot` combination are untested.
+- No WebP or AVIF encoder is available, so those weren't fuzzed or probed for size claims.
+- clang-cl isn't installed. Network shares and other CPUs weren't tested.
+- A single-strip compressed TIFF, which WIC never writes, would make every band decode from the top: no slower, but wasted CPU.
+
 ## 1. Critical: bugs, undefined behavior, security
 
 No undefined behavior or security hole survived verification. The one security candidate was disproved; it is listed at the end of this section so it isn't chased again.
@@ -314,9 +381,9 @@ Still open:
 ## 7. Roadmap (value ÷ cost)
 
 1. ~~C2 stuck animation request~~, ~~GlobalSize trim~~, ~~file size off the UI thread~~: done.
-2. **C1** GIF logical screen (S–M), with its repro as the test.
-3. **Test gaps** (M): sniffing, `ReadAnimation`, save round trips, `Neighbors`. Cheap insurance for the parts no test covers.
-4. **H2** HEIC orientation check (S, needs a sample), then fix if confirmed.
-5. **D1** color management: decide first, then M effort.
+2. ~~**C1** GIF logical screen~~: done (overhaul pass).
+3. **Test gaps** (M): sniffing, `ReadAnimation`, save round trips, `Neighbors`. Most are now covered by the test suite added in `0c1a831`.
+4. ~~**H2** HEIC orientation~~: settled with WIC-encoded HEICs (overhaul pass); a real iPhone sample is still untested.
+5. ~~**D1** color management~~: done (overhaul pass).
 6. ~~H10 PNG filter for Copy~~: measured, the default is already fastest.
 7. The remaining medium items, as the code around them is touched.
