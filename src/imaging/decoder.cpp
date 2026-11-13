@@ -739,12 +739,26 @@ HRESULT PlaceGifFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, IWICB
 // The most pixels a file of bytes in container can really hold, as its compression packs no more. WIC fills in what
 // is missing, so a small file claiming a huge size would otherwise take seconds and up to a gigabyte to show; files
 // cut short, as by a broken download, stay far below. Formats without such a bound get the general limit.
-UINT64 MaxPixels(IWICImagingFactory* wic, IWICBitmapSource* frame, const GUID& container, UINT64 bytes) {
+UINT64 MaxPixels(IWICImagingFactory* wic, IWICBitmapFrameDecode* frame, const GUID& container, UINT64 bytes) {
     if (container == GUID_ContainerFormatGif) return GifPixelLimit(bytes);
     // A JPEG spends at least a bit or so on every 8 x 8 block, even progressive: under 512 pixels a byte.
     if (container == GUID_ContainerFormatJpeg) return bytes * 1024;
     // Deflate packs at most 1032 bytes into one; twice that, for the row filter bytes and to spare.
     if (container == GUID_ContainerFormatPng) return bytes * 2064 * 8 / std::max(1u, BitsPerPixel(wic, frame));
+    // A run of up to 255 pixels takes 2 bytes; the rest is spare for rows that end early. An RLE BMP's end code
+    // would otherwise leave WIC filling in, and holding, the whole bitmap: 1.8 GB for a 1 KB file.
+    if (container == GUID_ContainerFormatBmp) return bytes * 1024;
+    // LZW, the loosest of TIFF's compressions but fax, emits at most 4096 bytes a code of 9 bits or more. Fax codes
+    // pack a blank row in a bit, so those get the general limit.
+    if (container == GUID_ContainerFormatTiff) {
+        ComPtr<IWICMetadataQueryReader> query;
+        PROPVARIANT compression{};
+        const bool fax = SUCCEEDED(frame->GetMetadataQueryReader(&query)) &&
+                         SUCCEEDED(query->GetMetadataByName(L"/ifd/{ushort=259}", &compression)) &&
+                         compression.vt == VT_UI2 && compression.uiVal >= 2 && compression.uiVal <= 4;
+        PropVariantClear(&compression);
+        if (!fax) return bytes * 4096 * 8 / std::max(1u, BitsPerPixel(wic, frame));
+    }
     return kMaxSourcePixels;
 }
 

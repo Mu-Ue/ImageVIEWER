@@ -474,6 +474,42 @@ void TestSniffing() {
 
 namespace {
 
+// Writes source as a TIFF in the given WICTiffCompressionOption and EXIF orientation.
+HRESULT EncodeTiff(const std::wstring& path, IWICBitmapSource* source, WICPixelFormatGUID format, BYTE compression,
+                   int orientation = 1) {
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> options;
+    ComPtr<IWICMetadataQueryWriter> meta;
+    UINT w = 0, h = 0;
+    source->GetSize(&w, &h);
+    PROPBAG2 name{};
+    name.pstrName = const_cast<LPOLESTR>(L"TiffCompressionMethod");
+    VARIANT value{};
+    value.vt = VT_UI1;
+    value.bVal = compression;
+    PROPVARIANT turn;
+    PropVariantInit(&turn);
+    turn.vt = VT_UI2;
+    turn.uiVal = USHORT(orientation);
+    HRESULT hr = Wic()->CreateStream(&stream);
+    if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+    if (SUCCEEDED(hr)) hr = Wic()->CreateEncoder(GUID_ContainerFormatTiff, nullptr, &encoder);
+    if (SUCCEEDED(hr)) hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+    if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(&frame, &options);
+    if (SUCCEEDED(hr)) hr = options->Write(1, &name, &value);
+    if (SUCCEEDED(hr)) hr = frame->Initialize(options.Get());
+    if (SUCCEEDED(hr)) hr = frame->SetSize(w, h);
+    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
+    if (SUCCEEDED(hr)) hr = frame->GetMetadataQueryWriter(&meta);
+    if (SUCCEEDED(hr)) hr = meta->SetMetadataByName(L"/ifd/{ushort=274}", &turn);
+    if (SUCCEEDED(hr)) hr = frame->WriteSource(source, nullptr);
+    if (SUCCEEDED(hr)) hr = frame->Commit();
+    if (SUCCEEDED(hr)) hr = encoder->Commit();
+    return hr;
+}
+
 // A small JPEG whose frame header claims it is w x h.
 std::vector<BYTE> ClaimedJpeg(std::mt19937& rng, UINT w, UINT h) {
     std::vector<BYTE> jpeg = EncodeBytes(GUID_ContainerFormatJpeg, RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 16, 16).Get());
@@ -556,7 +592,38 @@ void TestDecodeLimits() {
     }
     put32(29, ~crc);
     const std::vector<BYTE> jpeg = ClaimedJpeg(rng, 30000, 30000);
-    for (const std::vector<BYTE>* data : {const_cast<const std::vector<BYTE>*>(&png), &jpeg}) {
+    // An LZW TIFF whose width, length and rows per strip claim 16000 x 16000 in one strip.
+    const std::wstring tiffPath = TempPath(L"claim.tif");
+    EncodeTiff(tiffPath, RandomBitmap(rng, GUID_WICPixelFormat8bppGray, 64, 64).Get(), GUID_WICPixelFormat8bppGray,
+               WICTiffCompressionLZW);
+    std::vector<BYTE> tiff = ReadAll(tiffPath);
+    DeleteFileW(tiffPath.c_str());
+    const auto get = [&](size_t at, int n) {
+        UINT32 v = 0;
+        for (int k = n - 1; k >= 0; --k) v = v << 8 | tiff[at + k];
+        return v;
+    };
+    for (UINT32 at = get(4, 4) + 2, end = at + 12 * get(at - 2, 2); at < end; at += 12) {
+        const UINT32 tag = get(at, 2), type = get(at + 2, 2);
+        for (int k = 0; (tag == 256 || tag == 257 || tag == 278) && k < (type == 3 ? 2 : 4); ++k) {
+            tiff[at + 8 + k] = BYTE(16000 >> 8 * k);
+        }
+    }
+    // An RLE BMP of 16000 x 16000 whose data is only its end code, which leaves the rest to fill in.
+    std::vector<BYTE> bmp(14 + 40 + 1024 + 2);
+    const auto put = [&](size_t at, UINT32 v) { memcpy(&bmp[at], &v, 4); };
+    bmp[0] = 'B', bmp[1] = 'M';
+    put(2, UINT32(bmp.size()));
+    put(10, 14 + 40 + 1024);
+    put(14, 40);
+    put(18, 16000);
+    put(22, 16000);
+    put(26, 1 | 8 << 16);  // one plane of 8 bits
+    put(30, BI_RLE8);
+    put(34, 2);
+    put(46, 256);
+    bmp[bmp.size() - 1] = 1;  // 0 1: the end of the bitmap
+    for (const std::vector<BYTE>* data : std::initializer_list<const std::vector<BYTE>*>{&png, &jpeg, &tiff, &bmp}) {
         Image image;
         const ULONGLONG start = GetTickCount64();
         if (DecodeImage(Source{.stream = MemoryStream(*data)}, image) != WINCODEC_ERR_IMAGESIZEOUTOFRANGE) {
@@ -568,13 +635,16 @@ void TestDecodeLimits() {
     // Real images that pack best, one color all over, still open, as do files cut short, whose decoders show what
     // arrived.
     const ComPtr<IWICBitmap> flat = RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 4000, 4000, 1);
-    for (const GUID* container : {&GUID_ContainerFormatPng, &GUID_ContainerFormatJpeg}) {
+    for (const GUID* container : {&GUID_ContainerFormatPng, &GUID_ContainerFormatJpeg, &GUID_ContainerFormatTiff,
+                                  &GUID_ContainerFormatBmp}) {
         const std::vector<BYTE> whole = EncodeBytes(*container, flat.Get());
         const std::vector<BYTE> cut(whole.begin(), whole.begin() + ptrdiff_t(whole.size() / 2));
         const std::vector<BYTE> photo =
             EncodeBytes(*container, RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 1000, 800).Get());
         const std::vector<BYTE> photoCut(photo.begin(), photo.begin() + ptrdiff_t(photo.size() / 2));
-        for (const auto* data : {&whole, &cut, &photoCut}) {
+        // WIC itself refuses TIFFs and BMPs cut short.
+        const bool cuts = *container == GUID_ContainerFormatPng || *container == GUID_ContainerFormatJpeg;
+        for (const auto* data : {&whole, cuts ? &cut : &whole, cuts ? &photoCut : &whole}) {
             Image image;
             if (FAILED(DecodeImage(Source{.stream = MemoryStream(*data)}, image))) {
                 Fail("well-packed or cut-short image refused", int(data->size()));
@@ -582,6 +652,28 @@ void TestDecodeLimits() {
             if (image.bitmap) DeleteObject(image.bitmap);
         }
     }
+    // A blank A4 page scanned at 600 dpi: fax codes pack each row into a bit, tighter than LZW's limit allows.
+    std::vector<BYTE> fax = {'I', 'I', 42, 0};
+    const auto add = [&](UINT32 v, int n) {
+        for (int k = 0; k < n; ++k) fax.push_back(BYTE(v >> 8 * k));
+    };
+    const UINT32 rows = 7016, data = rows / 8 + 6;
+    add(8 + data, 4);
+    fax.resize(fax.size() + rows / 8, 0xFF);  // a 1 for each row: the same as the one above
+    for (const BYTE end : {BYTE(0), BYTE(0x10), BYTE(1), BYTE(0), BYTE(0x10), BYTE(1)}) fax.push_back(end);  // end of page
+    const UINT32 kTags[][3] = {{256, 4, 4960}, {257, 4, rows}, {258, 3, 1}, {259, 3, 4}, {262, 3, 0},
+                               {273, 4, 8}, {277, 3, 1}, {278, 4, rows}, {279, 4, data}};
+    add(UINT32(std::size(kTags)), 2);
+    for (const auto& t : kTags) {
+        add(t[0], 2);
+        add(t[1], 2);
+        add(1, 4);
+        add(t[2], 4);
+    }
+    add(0, 4);
+    Image page;
+    if (FAILED(DecodeImage(Source{.stream = MemoryStream(fax)}, page))) Fail("blank fax page refused", int(fax.size()));
+    if (page.bitmap) DeleteObject(page.bitmap);
 }
 
 // Large color JPEGs are decoded in bands on several threads, upright straight into the bitmap or else through
@@ -621,40 +713,8 @@ void TestBands() {
     for (const BYTE compression : {BYTE(WICTiffCompressionNone), BYTE(WICTiffCompressionLZW), BYTE(WICTiffCompressionZIP)}) {
         for (const int orientation : {1, 3, 6}) {
             const std::wstring path = TempPath(L"band" + std::to_wstring(++id) + L".tif");
-            ComPtr<IWICStream> stream;
-            ComPtr<IWICBitmapEncoder> encoder;
-            ComPtr<IWICBitmapFrameEncode> frame;
-            ComPtr<IPropertyBag2> options;
-            ComPtr<IWICMetadataQueryWriter> meta;
             const ComPtr<IWICBitmap> source = RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 1301, 1007);
-            WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
-            PROPBAG2 name{};
-            name.pstrName = const_cast<LPOLESTR>(L"TiffCompressionMethod");
-            VARIANT value{};
-            value.vt = VT_UI1;
-            value.bVal = compression;
-            PROPVARIANT turn;
-            PropVariantInit(&turn);
-            turn.vt = VT_UI2;
-            turn.uiVal = USHORT(orientation);
-            HRESULT hr = Wic()->CreateStream(&stream);
-            if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
-            if (SUCCEEDED(hr)) hr = Wic()->CreateEncoder(GUID_ContainerFormatTiff, nullptr, &encoder);
-            if (SUCCEEDED(hr)) hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
-            if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(&frame, &options);
-            if (SUCCEEDED(hr)) hr = options->Write(1, &name, &value);
-            if (SUCCEEDED(hr)) hr = frame->Initialize(options.Get());
-            if (SUCCEEDED(hr)) hr = frame->SetSize(1301, 1007);
-            if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
-            if (SUCCEEDED(hr)) hr = frame->GetMetadataQueryWriter(&meta);
-            if (SUCCEEDED(hr)) hr = meta->SetMetadataByName(L"/ifd/{ushort=274}", &turn);
-            if (SUCCEEDED(hr)) hr = frame->WriteSource(source.Get(), nullptr);
-            if (SUCCEEDED(hr)) hr = frame->Commit();
-            if (SUCCEEDED(hr)) hr = encoder->Commit();
-            meta.Reset();
-            frame.Reset();
-            encoder.Reset();
-            stream.Reset();
+            const HRESULT hr = EncodeTiff(path, source.Get(), GUID_WICPixelFormat24bppBGR, compression, orientation);
             if (FAILED(hr)) {
                 Fail("can't write a TIFF band test image", id);
                 continue;
