@@ -66,7 +66,8 @@ bool CanBeTransparent(IWICImagingFactory* wic, IWICBitmapSource* source);
 
 struct Animation;
 
-// Decodes into the smallest exact DIB section, colors converted to sRGB as OpenSource does for Colors::kSrgb. Needs COM initialized on the calling thread. If animated is
+// Decodes into the smallest exact DIB section, colors converted to sRGB as OpenSource does for Colors::kSrgb.
+// Works without COM for WIC's own codecs, and returns CO_E_NOTINITIALIZED if one that needs it has none. If animated is
 // given, it is set to whether the image is an animated GIF, and out is then its canvas showing the first
 // frame, for DecodeAnimation to play. Gives up with E_ABORT once stop, if given, is set.
 HRESULT DecodeImage(const Source& src, Image& out, bool* animated = nullptr, const std::atomic<bool>* stop = nullptr);

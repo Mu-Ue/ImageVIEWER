@@ -374,12 +374,16 @@ void SetImage(const Image& image, std::wstring name, UINT64 bytes) {
 
 // Work run on a thread of its own with its own COM apartment, which sets hr to its result. The UI thread never
 // starts COM, so when the thread ends COM unloads WIC and its codecs instead of keeping them in memory.
+// With comLater, work first runs without COM, which takes about a millisecond to start: WIC's own codecs never
+// need it, and Media Foundation starts it itself for the Store ones. Work that does need it runs again with it.
 template <class Work>
 struct ComJob {
     HRESULT hr;
     Work work;
+    bool comLater = false;
 
     void Run() {
+        if (comLater && (hr = work()) != CO_E_NOTINITIALIZED) return;
         hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (SUCCEEDED(hr)) {
             hr = work();
@@ -1061,7 +1065,7 @@ bool StartViewer(HINSTANCE instance, std::wstring path, int showCmd) {
         bytes = FileSize(g.source.path);
         return DecodeImage(g.source, image, &animated);
     };
-    ComJob<decltype(decode)> job{S_OK, decode};
+    ComJob<decltype(decode)> job{S_OK, decode, true};
     const HANDLE decoder = g.source.path.empty() ? nullptr : job.Start();
     PreloadStatusIcons();  // after the decoder thread, which waits longest, so it starts first
 

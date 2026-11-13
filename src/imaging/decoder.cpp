@@ -545,9 +545,12 @@ HRESULT DecodeBands(Band base, UINT height) {
         if (k == 0 || bands[k].y0 == bands[k].y1) continue;
         threads[k] = CreateThread(nullptr, 0, [](void* p) -> DWORD {
             Band& b = *static_cast<Band*>(p);
-            const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            b.hr = DecodeBand(b);
-            if (SUCCEEDED(com)) CoUninitialize();
+            // Without COM, as WIC's JPEG and TIFF decoders never need it, unless this one does.
+            if ((b.hr = DecodeBand(b)) == CO_E_NOTINITIALIZED &&
+                SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+                b.hr = DecodeBand(b);
+                CoUninitialize();
+            }
             return 0;
         }, &bands[k], 0, nullptr);
     }
