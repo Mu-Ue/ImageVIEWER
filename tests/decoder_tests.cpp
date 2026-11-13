@@ -540,6 +540,48 @@ void TestDecodeLimits() {
         if (GetTickCount64() - start > 2000) Fail("refusing a huge claimed size took long", int(GetTickCount64() - start));
         if (image.bitmap) DeleteObject(image.bitmap);
     }
+
+    // Under that limit, a small file still can't claim more pixels than its compression can pack: WIC would fill in
+    // the rest, taking seconds and most of a gigabyte. Found by fuzzing; GIF's own case is with the GIF tests.
+    std::vector<BYTE> png = EncodeBytes(GUID_ContainerFormatPng, RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 64, 64).Get());
+    const auto put32 = [&](size_t at, UINT32 v) {
+        for (int k = 0; k < 4; ++k) png[at + k] = BYTE(v >> (24 - 8 * k));
+    };
+    put32(16, 30000);  // IHDR width and height, then its CRC again
+    put32(20, 30000);
+    UINT32 crc = ~0u;
+    for (size_t i = 12; i < 29; ++i) {
+        crc ^= png[i];
+        for (int k = 0; k < 8; ++k) crc = crc >> 1 ^ (0xEDB88320u & (0 - (crc & 1)));
+    }
+    put32(29, ~crc);
+    const std::vector<BYTE> jpeg = ClaimedJpeg(rng, 30000, 30000);
+    for (const std::vector<BYTE>* data : {const_cast<const std::vector<BYTE>*>(&png), &jpeg}) {
+        Image image;
+        const ULONGLONG start = GetTickCount64();
+        if (DecodeImage(Source{.stream = MemoryStream(*data)}, image) != WINCODEC_ERR_IMAGESIZEOUTOFRANGE) {
+            Fail("small file claiming 900 MP wasn't refused", int(data->size()));
+        }
+        if (GetTickCount64() - start > 250) Fail("refusing a small file's claimed size took long", int(data->size()));
+        if (image.bitmap) DeleteObject(image.bitmap);
+    }
+    // Real images that pack best, one color all over, still open, as do files cut short, whose decoders show what
+    // arrived.
+    const ComPtr<IWICBitmap> flat = RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 4000, 4000, 1);
+    for (const GUID* container : {&GUID_ContainerFormatPng, &GUID_ContainerFormatJpeg}) {
+        const std::vector<BYTE> whole = EncodeBytes(*container, flat.Get());
+        const std::vector<BYTE> cut(whole.begin(), whole.begin() + ptrdiff_t(whole.size() / 2));
+        const std::vector<BYTE> photo =
+            EncodeBytes(*container, RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 1000, 800).Get());
+        const std::vector<BYTE> photoCut(photo.begin(), photo.begin() + ptrdiff_t(photo.size() / 2));
+        for (const auto* data : {&whole, &cut, &photoCut}) {
+            Image image;
+            if (FAILED(DecodeImage(Source{.stream = MemoryStream(*data)}, image))) {
+                Fail("well-packed or cut-short image refused", int(data->size()));
+            }
+            if (image.bitmap) DeleteObject(image.bitmap);
+        }
+    }
 }
 
 // Large color JPEGs are decoded in bands on several threads, upright straight into the bitmap or else through

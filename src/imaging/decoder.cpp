@@ -421,9 +421,14 @@ HRESULT CreateDecoder(IWICImagingFactory* wic, IStream* stream, ComPtr<IWICBitma
     return hr;
 }
 
-HRESULT OpenDecoder(IWICImagingFactory* wic, const Source& src, ComPtr<IWICBitmapDecoder>& decoder) {
+// Opens src's data with the decoder for its format; bytes, if given, is set to the data's size.
+HRESULT OpenDecoder(IWICImagingFactory* wic, const Source& src, ComPtr<IWICBitmapDecoder>& decoder,
+                    UINT64* bytes = nullptr) {
     ComPtr<IStream> stream = src.stream;
     HRESULT hr = stream ? S_OK : OpenFileStream(src.path, stream);
+    STATSTG stat{};
+    if (SUCCEEDED(hr) && bytes) hr = stream->Stat(&stat, STATFLAG_NONAME);
+    if (SUCCEEDED(hr) && bytes) *bytes = stat.cbSize.QuadPart;
     if (SUCCEEDED(hr)) hr = CreateDecoder(wic, stream.Get(), decoder);
     return hr;
 }
@@ -435,11 +440,11 @@ HRESULT CheckGif(IWICBitmapDecoder* decoder) {
 }
 
 // Shows the first frame of an animated GIF on a new 24bpp canvas. Fails for anything else.
-HRESULT DecodeFirstFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Image& out,
+HRESULT DecodeFirstFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT64 bytes, Image& out,
                          const std::atomic<bool>* stop) {
     Animation a;
     HRESULT hr = CheckGif(decoder);
-    if (SUCCEEDED(hr)) hr = ReadAnimation(wic, decoder, a, true, stop);
+    if (SUCCEEDED(hr)) hr = ReadAnimation(wic, decoder, bytes, a, true, stop);
     if (FAILED(hr)) return hr;
     const HBITMAP bitmap = CreateDib(a.width, a.height, 24, nullptr, 0, a.bits);
     if (!bitmap) return E_OUTOFMEMORY;
@@ -689,12 +694,16 @@ bool ToSrgb(IWICImagingFactory* wic, IWICBitmapFrameDecode* frame, ComPtr<IWICBi
 }
 
 // Puts a GIF's frame 0, which can be smaller than the image and anywhere on it, where it belongs on a transparent
-// canvas, as browsers show it. A canvas too large to make shows the frame alone.
-HRESULT PlaceGifFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, IWICBitmapFrameDecode* frame,
+// canvas, as browsers show it. A canvas too large to make, or larger than a file of bytes could fill, shows the
+// frame alone.
+HRESULT PlaceGifFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, IWICBitmapFrameDecode* frame, UINT64 bytes,
                       ComPtr<IWICBitmapSource>& source, UINT& width, UINT& height) {
     UINT w = 0, h = 0;
     HRESULT hr = GifCanvas(decoder, frame, w, h);
-    if (FAILED(hr) || (w == width && h == height) || w > kMaxBitmapSize || h > kMaxBitmapSize) return hr;
+    if (FAILED(hr) || (w == width && h == height) || w > kMaxBitmapSize || h > kMaxBitmapSize ||
+        UINT64(w) * h > GifPixelLimit(bytes)) {
+        return hr;
+    }
     const POINT at = GifFrameOffset(frame);
     ComPtr<IWICBitmap> canvas;
     ComPtr<IWICFormatConverter> bgra;
@@ -721,8 +730,21 @@ HRESULT PlaceGifFrame(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, IWICB
     return S_OK;
 }
 
+// The most pixels a file of bytes in container can really hold, as its compression packs no more. WIC fills in what
+// is missing, so a small file claiming a huge size would otherwise take seconds and up to a gigabyte to show; files
+// cut short, as by a broken download, stay far below. Formats without such a bound get the general limit.
+UINT64 MaxPixels(IWICImagingFactory* wic, IWICBitmapSource* frame, const GUID& container, UINT64 bytes) {
+    if (container == GUID_ContainerFormatGif) return GifPixelLimit(bytes);
+    // A JPEG spends at least a bit or so on every 8 x 8 block, even progressive: under 512 pixels a byte.
+    if (container == GUID_ContainerFormatJpeg) return bytes * 1024;
+    // Deflate packs at most 1032 bytes into one; twice that, for the row filter bytes and to spare.
+    if (container == GUID_ContainerFormatPng) return bytes * 2064 * 8 / std::max(1u, BitsPerPixel(wic, frame));
+    return kMaxSourcePixels;
+}
+
 // What OpenDecoded found out besides the pixels.
 struct Opened {
+    UINT64 bytes = 0;  // of the encoded data, set by OpenDecoder
     ComPtr<IWICBitmapFrameDecode> frame;
     SIZE full{};  // the stored size, before scaling
     int orientation = 1;  // the EXIF orientation, if not applied
@@ -742,8 +764,11 @@ HRESULT OpenDecoded(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT ma
     GUID container{};
     decoder->GetContainerFormat(&container);
     source = frame;
+    if (UINT64(width) * height > MaxPixels(wic, frame.Get(), container, info.bytes)) {
+        return WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
+    }
     if (container == GUID_ContainerFormatGif) {
-        hr = PlaceGifFrame(wic, decoder, frame.Get(), source, width, height);
+        hr = PlaceGifFrame(wic, decoder, frame.Get(), info.bytes, source, width, height);
         if (FAILED(hr)) return hr;
     }
     info.full = {LONG(width), LONG(height)};
@@ -818,7 +843,7 @@ HRESULT OpenSource(IWICImagingFactory* wic, const Source& src, UINT maxSize, Col
     }
     ComPtr<IWICBitmapDecoder> decoder;
     Opened info;
-    HRESULT hr = OpenDecoder(wic, src, decoder);
+    HRESULT hr = OpenDecoder(wic, src, decoder, &info.bytes);
     if (SUCCEEDED(hr)) {
         hr = OpenDecoded(wic, decoder.Get(), maxSize, colors, !orientation, profiles != nullptr, source, width, height,
                          info);
@@ -837,9 +862,10 @@ HRESULT DecodeAnimation(const Source& src, Animation& out, const std::atomic<boo
     Source own{src.path};
     if (SUCCEEDED(hr) && src.stream) hr = src.stream->Clone(&own.stream);
     ComPtr<IWICBitmapDecoder> decoder;
-    if (SUCCEEDED(hr)) hr = OpenDecoder(wic.Get(), own, decoder);
+    UINT64 bytes = 0;
+    if (SUCCEEDED(hr)) hr = OpenDecoder(wic.Get(), own, decoder, &bytes);
     if (SUCCEEDED(hr)) hr = CheckGif(decoder.Get());
-    if (SUCCEEDED(hr)) hr = ReadAnimation(wic.Get(), decoder.Get(), out, false, &stop);
+    if (SUCCEEDED(hr)) hr = ReadAnimation(wic.Get(), decoder.Get(), bytes, out, false, &stop);
     return hr;
 }
 
@@ -857,8 +883,9 @@ HRESULT DecodeImage(const Source& src, Image& out, bool* animated, const std::at
                         &info.orientation);
     } else {
         ComPtr<IWICBitmapDecoder> decoder;
-        hr = OpenDecoder(wic.Get(), src, decoder);
-        if (SUCCEEDED(hr) && animated && SUCCEEDED(DecodeFirstFrame(wic.Get(), decoder.Get(), out, stop))) {
+        hr = OpenDecoder(wic.Get(), src, decoder, &info.bytes);
+        if (SUCCEEDED(hr) && animated &&
+            SUCCEEDED(DecodeFirstFrame(wic.Get(), decoder.Get(), info.bytes, out, stop))) {
             *animated = true;
             return S_OK;
         }

@@ -148,6 +148,11 @@ void FakeClipboardFailOpens(int count);  // the next count opens fail, as when a
 UINT FakeClipboardPngFormat();
 UINT FakeClipboardHtmlFormat();
 
+// Saves source as target through a stream that ends the process midway, with kKilledMidSave ("tests.exe
+// --save-and-die <source> <target>"), so a test can check what a crashed save leaves behind.
+constexpr UINT kKilledMidSave = 3;
+int SaveAndDie(const wchar_t* source, const wchar_t* target);
+
 // The test groups, in the order they run.
 void TestScaling();
 void TestScalingEdges();

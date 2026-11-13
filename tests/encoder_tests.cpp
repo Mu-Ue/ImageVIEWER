@@ -406,6 +406,86 @@ void TestSaveSafety() {
         DeleteFileW((prefix + std::to_wstring(i) + L".tmp").c_str());
     }
     if (TempFiles(dir)) Fail("saves left temporary files", TempFiles(dir));
+
+    // Killed midway through writing, a save still leaves no temporary file, and no partial image.
+    {
+        const std::wstring crash = TempDir(L"save crash");
+        const std::wstring big = crash + L"big.png";
+        EncodeFile(big, GUID_ContainerFormatPng, RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 300, 300).Get());
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring command = L"\"" + std::wstring(exe) + L"\" --save-and-die \"" + big + L"\" \"" + crash +
+                               L"out.png\"";
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        DWORD code = 0;
+        if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            Fail("can't start a save to kill", int(GetLastError()));
+        } else {
+            WaitForSingleObject(pi.hProcess, 60000);
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            if (code != kKilledMidSave) Fail("save wasn't killed midway", int(code));
+            if (TempFiles(crash)) Fail("killed save left a temporary file", TempFiles(crash));
+            if (GetFileAttributesW((crash + L"out.png").c_str()) != INVALID_FILE_ATTRIBUTES) {
+                Fail("killed save left a partial image", 0);
+            }
+        }
+    }
+}
+
+namespace {
+
+// A stream on a file that ends this process when read past its first block, as a crash would.
+class DyingStream : public IStream {
+public:
+    explicit DyingStream(ComPtr<IStream> inner) : inner_(std::move(inner)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (iid != IID_IUnknown && iid != IID_IStream && iid != IID_ISequentialStream) return E_NOINTERFACE;
+        *out = this;
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override { return --refs_; }  // lives on SaveAndDie's stack
+    HRESULT STDMETHODCALLTYPE Read(void* p, ULONG n, ULONG* read) override {
+        ULARGE_INTEGER at{};
+        inner_->Seek({}, STREAM_SEEK_CUR, &at);
+        if (at.QuadPart >= 65536) TerminateProcess(GetCurrentProcess(), kKilledMidSave);
+        return inner_->Read(p, n, read);
+    }
+    HRESULT STDMETHODCALLTYPE Write(const void* p, ULONG n, ULONG* written) override { return inner_->Write(p, n, written); }
+    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER* at) override {
+        return inner_->Seek(move, origin, at);
+    }
+    HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER size) override { return inner_->SetSize(size); }
+    HRESULT STDMETHODCALLTYPE CopyTo(IStream* to, ULARGE_INTEGER n, ULARGE_INTEGER* read, ULARGE_INTEGER* written) override {
+        return inner_->CopyTo(to, n, read, written);
+    }
+    HRESULT STDMETHODCALLTYPE Commit(DWORD flags) override { return inner_->Commit(flags); }
+    HRESULT STDMETHODCALLTYPE Revert() override { return inner_->Revert(); }
+    HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER o, ULARGE_INTEGER n, DWORD t) override {
+        return inner_->LockRegion(o, n, t);
+    }
+    HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER o, ULARGE_INTEGER n, DWORD t) override {
+        return inner_->UnlockRegion(o, n, t);
+    }
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG* stat, DWORD flags) override { return inner_->Stat(stat, flags); }
+    HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
+
+private:
+    ComPtr<IStream> inner_;
+    ULONG refs_ = 1;
+};
+
+}  // namespace
+
+int SaveAndDie(const wchar_t* source, const wchar_t* target) {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;
+    DyingStream stream(MemoryStream(ReadAll(source)));
+    SaveImage(Source{.stream = &stream}, target);  // the same format, so copied block by block
+    return 2;  // not killed: the test fails
 }
 
 // The types Save As offers, the extensions each writes, and the images the viewer opens and steps through all

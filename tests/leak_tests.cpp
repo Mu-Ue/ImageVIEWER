@@ -22,6 +22,9 @@ void TestLeaks() {
     add(L"rotated.jpg", GUID_ContainerFormatJpeg, RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 120, 80).Get(), 6);
     add(L"bands.jpg", GUID_ContainerFormatJpeg, RandomBitmap(rng, GUID_WICPixelFormat24bppBGR, 1500, 800).Get());
     add(L"gray.tif", GUID_ContainerFormatTiff, RandomBitmap(rng, GUID_WICPixelFormat8bppGray, 120, 80).Get());
+    paths.push_back(dir + L"p3 bands.jpg");  // converted to sRGB, in bands
+    EncodeFile(paths.back(), GUID_ContainerFormatJpeg, GradientBitmap(1500, 800).Get(), nullptr, 1,
+               ProfileFrom(DisplayP3Profile()).Get());
     Gif gif{30, 20, std::vector<UINT32>(256, 0x336699), 0};
     gif.frames = {RandomGifFrame(rng, {0, 0, 30, 20}, 256), RandomGifFrame(rng, {5, 5, 25, 15}, 256)};
     gif.frames[0].disposal = 3;

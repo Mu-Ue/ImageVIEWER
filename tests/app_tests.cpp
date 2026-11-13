@@ -159,8 +159,12 @@ void TestApp() {
             if (StatusOf(main) != L"64 × 48, " + FormatSizeForTests(ReadAll(a).size()) + L", 100%") {
                 Fail("viewer status bar shows the wrong info", 0);
             }
+            // The AddressSanitizer's own runtime loads OLE Automation, so that one is only checked without it.
+            const bool sanitized = GetModuleHandleW(L"clang_rt.asan_dynamic-x86_64.dll") != nullptr;
             for (const wchar_t* dll : kNeverIdle) {
-                if (app.Loaded(dll)) Fail("DLL loaded with an image shown", int(wcslen(dll)));
+                if (app.Loaded(dll) && !(sanitized && wcscmp(dll, L"oleaut32.dll") == 0)) {
+                    Fail("DLL loaded with an image shown", int(wcslen(dll)));
+                }
             }
             PostMessageW(main, WM_KEYDOWN, VK_RIGHT, 0);
             if (!WaitFor([&] { return WindowText(main) == L"b.jpg"; })) Fail("viewer didn't step to the next image", 0);

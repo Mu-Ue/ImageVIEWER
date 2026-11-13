@@ -69,8 +69,8 @@ HRESULT GifCanvas(IWICBitmapDecoder* decoder, IWICBitmapFrameDecode* first, UINT
     return S_OK;
 }
 
-HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Animation& out, bool firstOnly,
-                      const std::atomic<bool>* stop) {
+HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT64 bytes, Animation& out,
+                      bool firstOnly, const std::atomic<bool>* stop) {
     // Counted by asking for frames in turn: WIC indexes a GIF only as far as asked, so a file of millions of
     // tiny frames stops at the cap instead of being indexed whole. Asking in order also keeps clear of a WIC
     // quirk, where jumping past the last frame makes up one more.
@@ -92,7 +92,8 @@ HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Anima
     if (SUCCEEDED(hr)) hr = GifCanvas(decoder, first.Get(), width, height);
     if (FAILED(hr)) return hr;
     first.Reset();
-    if (width == 0 || height == 0 || width > kMaxBitmapSize || height > kMaxBitmapSize) {
+    if (width == 0 || height == 0 || width > kMaxBitmapSize || height > kMaxBitmapSize ||
+        UINT64(width) * height > GifPixelLimit(bytes)) {
         return WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
     }
 
@@ -102,6 +103,7 @@ HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Anima
     std::vector<Frame> frames(count);
     std::vector<GifPalette> palettes;
     UINT64 total = 0, budget = 0;  // index bytes, and those plus the frames' and palettes' own size
+    UINT64 claimed = 0;  // pixels the frames say they have
     size_t saved = 0;
     for (UINT i = 0; i < count; ++i) {
         ComPtr<IWICBitmapFrameDecode> frame;
@@ -149,7 +151,8 @@ HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Anima
         f.offset = size_t(total);
         total += area;
         budget += area + sizeof(Frame);
-        if (budget > kMaxAnimationBytes) return WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
+        claimed += UINT64(w) * h;  // decoding may read a frame whole, however much of it is on the canvas
+        if (budget > kMaxAnimationBytes || claimed > GifPixelLimit(bytes)) return WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
         if (f.disposal == 3) saved = std::max(saved, size_t(area) * 3);
     }
 

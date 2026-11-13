@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "config.h"
+#include "platform/modal.h"
 
 namespace {
 
@@ -120,19 +121,7 @@ std::wstring RunFileDialog(HWND owner, const wchar_t* kind, const std::wstring& 
 
     // Modal like an in-process dialog, but keep painting while it is open.
     EnableWindow(owner, FALSE);
-    bool quit = false;
-    while (!quit && MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT) == WAIT_OBJECT_0 + 1) {
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) {
-                PostQuitMessage(int(msg.wParam));
-                quit = true;
-                break;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
+    const bool quit = !PumpUntil(pi.hProcess);
     if (quit) TerminateProcess(pi.hProcess, 1);
     EnableWindow(owner, TRUE);
     SetForegroundWindow(owner);

@@ -8,7 +8,6 @@
 #include <cmath>
 #include <cstdio>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 #include "config.h"
@@ -17,6 +16,7 @@
 #include "imaging/encoder.h"
 #include "platform/clipboard.h"
 #include "platform/file_dialog.h"
+#include "platform/modal.h"
 #include "ui/draw.h"
 #include "ui/menu_bar.h"
 #include "ui/scale.h"
@@ -372,17 +372,36 @@ void SetImage(const Image& image, std::wstring name, UINT64 bytes) {
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
-// Runs work on a new thread with its own COM apartment, setting hr to its result. The UI thread never
+// Work run on a thread of its own with its own COM apartment, which sets hr to its result. The UI thread never
 // starts COM, so when the thread ends COM unloads WIC and its codecs instead of keeping them in memory.
 template <class Work>
-std::thread ComThread(HRESULT& hr, Work work) {
-    return std::thread([&hr, work] {
+struct ComJob {
+    HRESULT hr;
+    Work work;
+
+    void Run() {
         hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (SUCCEEDED(hr)) {
             hr = work();
             CoUninitialize();
         }
-    });
+    }
+    // Starts the thread, which the caller must wait for and close. If none can be made, runs the work here
+    // instead and returns null.
+    HANDLE Start() {
+        const HANDLE thread = CreateThread(nullptr, 0, [](void* job) -> DWORD {
+            static_cast<ComJob*>(job)->Run();
+            return 0;
+        }, this, 0, nullptr);
+        if (!thread) Run();
+        return thread;
+    }
+};
+
+void Join(HANDLE thread) {
+    if (!thread) return;
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
 }
 
 // How a decode was asked for, which decides what a failure does. Animate only reads the frames of the
@@ -636,31 +655,18 @@ void OnDecoded(Decode* d);
 // is shown afterwards, as work may be reading the bitmap shown. Returns E_ABORT if the window closed meanwhile.
 template <class Work>
 HRESULT RunModal(Work work) {
-    HRESULT hr = E_FAIL;
-    std::thread thread = ComThread(hr, std::move(work));
-    const HANDLE handle = thread.native_handle();
+    ComJob<Work> job{E_FAIL, std::move(work)};
     g.modal = true;
     EnableWindow(g.hwnd, FALSE);
-    bool quit = false;
-    while (!quit && MsgWaitForMultipleObjects(1, &handle, FALSE, INFINITE, QS_ALLINPUT) == WAIT_OBJECT_0 + 1) {
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) {
-                PostQuitMessage(int(msg.wParam));
-                quit = true;
-                break;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-    thread.join();
+    const HANDLE thread = job.Start();
+    const bool quit = thread && !PumpUntil(thread);
+    Join(thread);
     g.modal = false;
     if (quit) return E_ABORT;
     EnableWindow(g.hwnd, TRUE);
     if (GetActiveWindow() == g.hwnd) SetFocus(g.hwnd);  // disabling took the keyboard focus away
     if (Decode* const d = std::exchange(g.held, nullptr)) OnDecoded(d);
-    return hr;
+    return job.hr;
 }
 
 // What a save or copy reads: the source, plus the bitmap shown when it holds every source pixel, so it is read
@@ -1051,20 +1057,18 @@ bool StartViewer(HINSTANCE instance, std::wstring path, int showCmd) {
     Image image;
     bool animated = false;
     UINT64 bytes = 0;
-    HRESULT decodeHr = S_OK;
-    std::thread decoder;
-    if (!g.source.path.empty()) {
-        decoder = ComThread(decodeHr, [&] {
-            bytes = FileSize(g.source.path);
-            return DecodeImage(g.source, image, &animated);
-        });
-    }
+    const auto decode = [&] {
+        bytes = FileSize(g.source.path);
+        return DecodeImage(g.source, image, &animated);
+    };
+    ComJob<decltype(decode)> job{S_OK, decode};
+    const HANDLE decoder = g.source.path.empty() ? nullptr : job.Start();
     PreloadStatusIcons();  // after the decoder thread, which waits longest, so it starts first
 
     g.hwnd = CreateMainWindow(instance);
-    if (decoder.joinable()) decoder.join();
-    if (FAILED(decodeHr)) {
-        ShowError(decodeHr, g.name);
+    Join(decoder);
+    if (FAILED(job.hr)) {
+        ShowError(job.hr, g.name);
         return false;
     }
     if (!g.hwnd) return false;

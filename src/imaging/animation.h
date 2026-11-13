@@ -40,10 +40,18 @@ HRESULT GifCanvas(IWICBitmapDecoder* decoder, IWICBitmapFrameDecode* first, UINT
 // Where a GIF frame starts on the canvas.
 POINT GifFrameOffset(IWICBitmapFrameDecode* frame);
 
+// The most pixels a GIF of this many bytes can hold. LZW codes are at most 12 bits and stand for at most 4096
+// pixels, so real data holds under 2730 pixels a byte. A frame claiming more is a size its data can't fill, which
+// WIC would spend seconds decoding anyway.
+inline UINT64 GifPixelLimit(UINT64 bytes) {
+    return bytes * 4096;
+}
+
 // Reads every frame of a GIF decoder with more than one, or only the first if firstOnly. Fails if it has
-// fewer, or is too large to play, and gives up with E_ABORT once stop is set.
-HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, Animation& out, bool firstOnly,
-                      const std::atomic<bool>* stop = nullptr);
+// fewer, is too large to play, or its frames claim more pixels than its bytes (the file's size) can hold, and
+// gives up with E_ABORT once stop is set.
+HRESULT ReadAnimation(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, UINT64 bytes, Animation& out,
+                      bool firstOnly, const std::atomic<bool>* stop = nullptr);
 
 // Draws frame i over the previous one on the canvas and returns how long to show it.
 UINT ShowFrame(Animation& animation, size_t i);

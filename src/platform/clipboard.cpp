@@ -94,8 +94,9 @@ HRESULT CopyImageData(UINT format, Microsoft::WRL::ComPtr<IStream>& out) {
         if (BYTE* d = static_cast<BYTE*>(GlobalLock(copy))) {
             std::copy_n(reinterpret_cast<const BYTE*>(&file), header, d);
             std::copy_n(p, size, d + header);
-            // A color profile may be linked by file path, even on a network share: say sRGB instead, which
-            // leaves every pixel as it is, since profiles are never applied.
+            // A color profile may be linked by file path, even on a network share. WIC's BMP decoder reads no
+            // profiles, so this changes nothing shown, but a pasted DIB saved as .bmp is copied byte for byte, and
+            // other programs could then follow the link: say sRGB instead.
             BITMAPV5HEADER v5;
             if (!png && size >= sizeof(v5) && (memcpy(&v5, p, sizeof(v5)), v5.bV5Size == sizeof(v5)) &&
                 (v5.bV5CSType == PROFILE_LINKED || v5.bV5CSType == PROFILE_EMBEDDED)) {
@@ -258,6 +259,8 @@ bool SetClipboardImage(HWND owner, HGLOBAL png, HGLOBAL dib) {
             if (SetClipboardData(CF_DIB, dib)) {
                 dib = nullptr;
                 done = true;
+            } else {
+                EmptyClipboard();  // a PNG alone, which many programs can't paste, isn't a copy
             }
         }
         CloseClipboard();

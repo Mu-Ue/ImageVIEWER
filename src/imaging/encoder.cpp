@@ -323,6 +323,9 @@ HRESULT CopyStream(IStream* from, IStream* to) {
 HRESULT SaveImage(const Source& src, const std::wstring& path) {
     const HANDLE file = CreateTempFile(path);
     if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+    // Deleted when closed until it is renamed into place, so even a crash or kill midway leaves no temporary file.
+    FILE_DISPOSITION_INFO dispose{TRUE};
+    const bool pending = SetFileInformationByHandle(file, FileDispositionInfo, &dispose, sizeof(dispose));
     ComPtr<IStream> stream;  // owns the file once made
     HRESULT hr = CreateHandleStream(file, stream);
     if (SUCCEEDED(hr)) {
@@ -346,10 +349,14 @@ HRESULT SaveImage(const Source& src, const std::wstring& path) {
         }
     }  // releases the source file, which may be the one replaced
 
+    dispose.DeleteFile = FALSE;
+    if (SUCCEEDED(hr) && pending && !SetFileInformationByHandle(file, FileDispositionInfo, &dispose, sizeof(dispose))) {
+        hr = HRESULT_FROM_WIN32(GetLastError());  // renamed, it would still be deleted
+    }
     if (SUCCEEDED(hr)) hr = RenameTo(file, path);
     if (FAILED(hr)) {
-        FILE_DISPOSITION_INFO remove{TRUE};
-        SetFileInformationByHandle(file, FileDispositionInfo, &remove, sizeof(remove));
+        dispose.DeleteFile = TRUE;
+        SetFileInformationByHandle(file, FileDispositionInfo, &dispose, sizeof(dispose));
     }
     if (!stream) CloseHandle(file);
     return hr;

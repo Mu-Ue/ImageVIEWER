@@ -92,6 +92,7 @@ const std::wstring& TestDesktop() {
 
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 2 && wcscmp(argv[1], L"--dialog") == 0) return FakeDialog();
+    if (argc >= 4 && wcscmp(argv[1], L"--save-and-die") == 0) return SaveAndDie(argv[2], argv[3]);
     setvbuf(stdout, nullptr, _IONBF, 0);
     // WIC's JPEG decoder complains on stderr about the damaged files the tests feed it on purpose, through the
     // system's C runtime rather than this program's.

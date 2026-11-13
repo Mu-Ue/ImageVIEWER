@@ -312,6 +312,35 @@ void TestGifFiles() {
         }
     }
 
+    // A tiny GIF claiming far more pixels than its data can hold, which WIC would spend about a second decoding, is
+    // refused at once, found by fuzzing: here 76 bytes claiming a 16384 x 11264 frame. A canvas claimed that large
+    // around a 1 x 1 frame shows the frame alone.
+    {
+        const std::vector<BYTE> claims = {
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x0D, 0x00, 0x09, 0x00, 0x70, 0x00, 0x00, 0x21, 0x24, 0x04, 0x01, 0x00,
+            0x00, 0x03, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x0D, 0x40, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x0D, 0x00,
+            0x09, 0x00, 0x82, 0x7E, 0x0F, 0x0D, 0xA3, 0xCB, 0x17, 0x31, 0x29, 0x7B, 0x5D, 0x72, 0xC7, 0x14, 0xB6, 0x56,
+            0xAF, 0xAE, 0xCB, 0x7D, 0x3A, 0x56, 0x75, 0xEB, 0x5E, 0x1D, 0x34, 0x51, 0x21, 0xE5, 0x99, 0x9F, 0xA7, 0xA5,
+            0x55, 0x02, 0x00, 0x3B};
+        Gif dot{kMaxBitmapSize, kMaxBitmapSize, {0xFF0000, 0x00FF00}, -1};
+        dot.frames = {RandomGifFrame(rng, {0, 0, 1, 1}, 2), RandomGifFrame(rng, {0, 0, 1, 1}, 2)};
+        const std::vector<BYTE> sprite = WriteGif(dot);
+        dot.frames.resize(1);
+        const std::vector<BYTE> still = WriteGif(dot);
+        for (const auto* data : {&claims, &sprite, &still}) {
+            const ULONGLONG start = GetTickCount64();
+            Image image;
+            bool animated = false;
+            const HRESULT hr = DecodeImage(Source{.stream = MemoryStream(*data)}, image, &animated);
+            if (GetTickCount64() - start > 250) Fail("GIF claiming more than its data holds took long", int(data->size()));
+            if (data == &claims ? hr != WINCODEC_ERR_IMAGESIZEOUTOFRANGE
+                                : FAILED(hr) || animated || image.width != 1 || image.height != 1) {
+                Fail("GIF claiming more than its data holds opened wrong", int(data->size()));
+            }
+            if (image.bitmap) DeleteObject(image.bitmap);
+        }
+    }
+
     // Other formats are never read as animations.
     {
         const std::vector<BYTE> png =

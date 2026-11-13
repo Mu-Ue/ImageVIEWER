@@ -19,6 +19,8 @@ This produces `build\ImageVIEWER.exe`, a single file with no dependencies.
 
 To check that images are shown and saved exactly and that the app behaves, run `cmake --build build --target tests`, then `build\tests.exe`. Add words to run only the test groups whose names contain them, such as `build\tests.exe save viewer`. The tests run on a hidden desktop with a fake clipboard, so nothing appears on screen and your clipboard is left alone.
 
+To look for memory errors, configure a separate build folder with `-DIMAGEVIEWER_ASAN=ON` and run its `tests.exe` with the compiler's `bin\Hostx64\x64` folder on `PATH`, for AddressSanitizer's DLL. With `-DIMAGEVIEWER_FUZZ=ON`, the `fuzz` target feeds random images and clipboard data through decoding and pasting; see [fuzz/fuzz.cpp](fuzz/fuzz.cpp) for how to run it.
+
 ## Use
 
 ```

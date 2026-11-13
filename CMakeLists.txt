@@ -34,7 +34,13 @@ target_link_libraries(ImageVIEWER PRIVATE delayimp kernel32 user32 gdi32 imm32 d
 # Only needed for the file picker and --register; keep them off the startup path.
 target_link_options(ImageVIEWER PRIVATE /DELAYLOAD:comdlg32.dll /DELAYLOAD:shell32.dll)
 # Control-flow guard, shadow stack, and DLL imports from System32 only (no planted DLLs next to the exe).
-target_link_options(ImageVIEWER PRIVATE /GUARD:CF /GUARD:EHCONT /CETCOMPAT /DEPENDENTLOADFLAG:0x800)
+target_link_options(ImageVIEWER PRIVATE /GUARD:CF /GUARD:EHCONT /CETCOMPAT)
+# AddressSanitizer build of the app and its tests, to find memory errors: -DIMAGEVIEWER_ASAN=ON. Run it with the
+# compiler's bin folder on PATH, for the sanitizer's DLL, which the System32-only import rule would refuse.
+option(IMAGEVIEWER_ASAN "Build with AddressSanitizer (testing only)" OFF)
+if(NOT IMAGEVIEWER_ASAN)
+    target_link_options(ImageVIEWER PRIVATE /DEPENDENTLOADFLAG:0x800)
+endif()
 # Checks that what the viewer shows and saves is exact, and that the app behaves. Not built by default:
 # cmake --build build --target tests. clipboard_tests.cpp and viewer_tests.cpp build in clipboard.cpp, viewer.cpp
 # and file_dialog.cpp themselves, to reach their internals.
@@ -63,5 +69,29 @@ target_compile_definitions(tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NO
 target_compile_options(tests PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(tests PRIVATE kernel32 user32 gdi32 ole32 uuid dwmapi shell32 comdlg32)
 add_dependencies(tests ImageVIEWER)  # app_tests.cpp runs it
+enable_testing()
+add_test(NAME tests COMMAND tests)  # ctest runs it, once built
+if(IMAGEVIEWER_ASAN)
+    foreach(target ImageVIEWER tests)
+        target_compile_options(${target} PRIVATE /fsanitize=address /Zi)
+        target_link_options(${target} PRIVATE /DEBUG /INCREMENTAL:NO)
+    endforeach()
+endif()
+# Fuzzing of what untrusted data reaches, with libFuzzer and AddressSanitizer: -DIMAGEVIEWER_FUZZ=ON, then
+# cmake --build build --target fuzz. See fuzz/fuzz.cpp for how to run it.
+option(IMAGEVIEWER_FUZZ "Build the fuzz target (testing only)" OFF)
+if(IMAGEVIEWER_FUZZ)
+    add_executable(fuzz EXCLUDE_FROM_ALL
+        fuzz/fuzz.cpp
+        src/imaging/animation.cpp
+        src/imaging/decoder.cpp
+        src/platform/handle_stream.cpp
+        src/ui/scale.cpp)
+    target_include_directories(fuzz PRIVATE src)
+    target_compile_definitions(fuzz PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(fuzz PRIVATE /W4 /permissive- /utf-8 /fsanitize=address /fsanitize=fuzzer /Zi)
+    target_link_options(fuzz PRIVATE /DEBUG /INCREMENTAL:NO)
+    target_link_libraries(fuzz PRIVATE kernel32 user32 gdi32 ole32 uuid shell32)
+endif()
 # Double-clickable helper next to the exe that runs --register.
 configure_file(register.bat ${CMAKE_BINARY_DIR}/register.bat COPYONLY)
