@@ -461,8 +461,8 @@ bool ToSrgb(IWICImagingFactory* wic, IWICBitmapFrameDecode* frame, ComPtr<IWICBi
 
 constexpr UINT64 kMinBandPixels = 1 << 20;  // smaller JPEGs decode sooner than extra threads start
 constexpr UINT kMaxBands = 4;  // later bands spend most of their time reading past the rows above
-// Converting colors, or reading TIFF strips, costs every band the same for its own rows, so more bands pay:
-// measured best on 16 cores.
+// Converting colors, placing a rotated image's rows, or reading TIFF strips, costs every band the same for its own
+// rows, so more bands pay: measured best on 16 cores.
 constexpr UINT kMaxEvenBands = 8;
 
 // Whether a JPEG frame's scans each hold every component, so a decoder can produce a band of rows after reading
@@ -525,12 +525,12 @@ HRESULT DecodeBand(const Band& b) {
 
 // Decodes a large JPEG or TIFF in bands on several cores, this thread taking the first. Each band of a JPEG reads
 // past the data of the rows above it, at a bit under half the cost of decoding them, so each band is about 0.57
-// times as tall as the one above for all to finish together; 0.9 when converting colors, which costs the same in
-// every band. A TIFF band reads only its own strips, so those are all as tall.
+// times as tall as the one above for all to finish together; 0.9 when converting colors or placing rotated rows,
+// which cost the same in every band. A TIFF band reads only its own strips, so those are all as tall.
 HRESULT DecodeBands(Band base, UINT height) {
-    const UINT count = std::clamp(UINT(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 1u,
-                                  base.toSrgb || base.strips ? kMaxEvenBands : kMaxBands);
-    const double shrink = base.strips ? 1.0 : base.toSrgb ? 0.9 : 0.57;
+    const bool even = base.toSrgb || base.strips || !base.direct;
+    const UINT count = std::clamp(UINT(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 1u, even ? kMaxEvenBands : kMaxBands);
+    const double shrink = base.strips ? 1.0 : even ? 0.9 : 0.57;
     double weights[kMaxEvenBands], total = 0;
     for (UINT k = 0; k < count; ++k) total += weights[k] = k ? weights[k - 1] * shrink : 1.0;
     Band bands[kMaxEvenBands];
